@@ -198,7 +198,10 @@ class GatedWaveMerge(nn.Module):
 
         skip = self.skip_proj[depth](left_mean.reshape(bsz * n_heads, dim)).view(bsz, n_heads, 1, dim)
         alpha = torch.sigmoid(self.skip_alpha[depth])
-        return parent_norm + alpha * skip
+        out = parent_norm + alpha * skip
+        if out.dtype != f_left.dtype:
+            out = out.to(f_left.dtype)
+        return out
 
     def forward_batched(
         self,
@@ -306,8 +309,8 @@ class DCWTv2Attention(nn.Module):
         ] = {}
 
     def _apply_cross_head_coupling(self, f: torch.Tensor, depth: int) -> torch.Tensor:
-        coupling = F.softmax(self.cross_head_coupling[depth], dim=-1)  # (H, H)
-        return torch.einsum("ij,bjkd->bikd", coupling, f)
+        coupling = F.softmax(self.cross_head_coupling[depth], dim=-1).to(f.dtype)  # (H, H)
+        return torch.einsum("ij,bjkd->bikd", coupling, f).to(f.dtype)
 
     def _build_tree_training(self, v: torch.Tensor) -> torch.Tensor:
         """
@@ -321,6 +324,7 @@ class DCWTv2Attention(nn.Module):
 
         # Dense tree storage.
         tree = v.new_zeros(bsz, tree_size, n_heads, self.k_max, dim)
+        tree_dtype = tree.dtype
         node_present = torch.zeros(tree_size, dtype=torch.bool, device=v.device)
 
         # Insert leaves (K=1).
@@ -353,7 +357,9 @@ class DCWTv2Attention(nn.Module):
             f_left = tree[:, left_start:left_start + 2 * n_nodes:2, :, :k_child, :]
             f_right = tree[:, right_start:right_start + 2 * n_nodes:2, :, :k_child, :]
 
-            merged = self.gated_wave_merge.forward_batched(f_left, f_right, d_from_leaf)
+            merged = self.gated_wave_merge.forward_batched(
+                f_left, f_right, d_from_leaf
+            ).to(tree_dtype)
             k_parent = merged.shape[3]
 
             parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
@@ -368,8 +374,8 @@ class DCWTv2Attention(nn.Module):
             if bool(right_only.any()):
                 parent[:, right_only, :, :k_child, :] = f_right[:, right_only, :, :, :]
 
-            coupling = F.softmax(self.cross_head_coupling[d_from_leaf], dim=-1)
-            parent = torch.einsum("ij,bmjkd->bmikd", coupling, parent)
+            coupling = F.softmax(self.cross_head_coupling[d_from_leaf], dim=-1).to(tree_dtype)
+            parent = torch.einsum("ij,bmjkd->bmikd", coupling, parent).to(tree_dtype)
 
             tree[:, node_start:node_end, :, :, :] = parent
             node_present[node_start:node_end] = has_any
@@ -480,7 +486,7 @@ class DCWTv2Attention(nn.Module):
 
         # Preserve the original behavior: mean over nodes in cover set.
         counts = valid_mask.sum(dim=1).clamp(min=1).view(1, seq_len, 1, 1).to(out.dtype)
-        return out / counts
+        return (out / counts).to(q.dtype)
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         squeeze = False

@@ -12,11 +12,18 @@ This module implements the architecture proposed in newproposal.txt:
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import triton  # noqa: F401
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
 
 
 def k_at_depth(d_leaf: int, k_max: int) -> int:
@@ -118,6 +125,7 @@ class GatedWaveMerge(nn.Module):
     def _rotate_right(self, f: torch.Tensor, depth: int) -> torch.Tensor:
         """
         Apply depth-scaled complex rotation to right-branch vectors.
+        Uses Triton kernel when available on CUDA.
         """
         alpha_base = F.softplus(self.wave_damp_base)  # (H,)
         omega_base = self.wave_freq_base
@@ -133,12 +141,27 @@ class GatedWaveMerge(nn.Module):
         phi_real = decay * torch.cos(omega_d * delta_t + phi_d)
         phi_imag = decay * torch.sin(omega_d * delta_t + phi_d)
 
+        if TRITON_AVAILABLE and f.is_cuda:
+            try:
+                from .triton_wave_rotate import wave_rotate_triton
+
+                return wave_rotate_triton(f, phi_real, phi_imag)
+            except Exception:
+                # Fall through to the PyTorch implementation.
+                pass
+
         d2 = self.head_dim // 2
         f_re = f[..., :d2]
         f_im = f[..., d2:]
 
-        pr = phi_real.view(1, self.num_heads, 1, 1)
-        pi_ = phi_imag.view(1, self.num_heads, 1, 1)
+        if f.dim() == 4:
+            pr = phi_real.view(1, self.num_heads, 1, 1)
+            pi_ = phi_imag.view(1, self.num_heads, 1, 1)
+        elif f.dim() == 5:
+            pr = phi_real.view(1, 1, self.num_heads, 1, 1)
+            pi_ = phi_imag.view(1, 1, self.num_heads, 1, 1)
+        else:
+            raise ValueError(f"Unexpected tensor rank for rotation: {f.dim()}")
 
         rot_re = pr * f_re - pi_ * f_im
         rot_im = pi_ * f_re + pr * f_im
@@ -176,6 +199,28 @@ class GatedWaveMerge(nn.Module):
         skip = self.skip_proj[depth](left_mean.reshape(bsz * n_heads, dim)).view(bsz, n_heads, 1, dim)
         alpha = torch.sigmoid(self.skip_alpha[depth])
         return parent_norm + alpha * skip
+
+    def forward_batched(
+        self,
+        f_left: torch.Tensor,   # (B, M, H, K_left, D)
+        f_right: torch.Tensor,  # (B, M, H, K_right, D)
+        depth: int,
+    ) -> torch.Tensor:
+        """
+        Batched merge for all nodes at a tree level.
+        Mathematically equivalent to calling forward() M times.
+        """
+        bsz, n_nodes, n_heads, k_left, dim = f_left.shape
+        _, _, _, k_right, _ = f_right.shape
+        if n_heads != self.num_heads or dim != self.head_dim:
+            raise ValueError("Unexpected tensor shape in GatedWaveMerge.forward_batched.")
+
+        left_flat = f_left.reshape(bsz * n_nodes, n_heads, k_left, dim)
+        right_flat = f_right.reshape(bsz * n_nodes, n_heads, k_right, dim)
+        merged_flat = self.forward(left_flat, right_flat, depth)
+
+        k_parent = merged_flat.shape[2]
+        return merged_flat.reshape(bsz, n_nodes, n_heads, k_parent, dim)
 
 
 class DepthDecomposedQuery(nn.Module):
@@ -255,41 +300,93 @@ class DCWTv2Attention(nn.Module):
         nn.init.constant_(self.gate_proj.bias, 2.0)
 
         self.dropout = nn.Dropout(dropout)
+        self._local_mask_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+        self._cover_table_cache: Dict[
+            Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
     def _apply_cross_head_coupling(self, f: torch.Tensor, depth: int) -> torch.Tensor:
         coupling = F.softmax(self.cross_head_coupling[depth], dim=-1)  # (H, H)
         return torch.einsum("ij,bjkd->bikd", coupling, f)
 
-    def _build_tree_training(self, v: torch.Tensor) -> Dict[int, torch.Tensor]:
+    def _build_tree_training(self, v: torch.Tensor) -> torch.Tensor:
         """
-        Build sparse tree from all sequence values.
+        Build a dense tree tensor using level-parallel merges.
+
         v: (B, N, H, D_head)
+        returns: (B, T, H, K_max, D_head), T = self.tree_size
         """
-        bsz, seq_len, _, _ = v.shape
-        tree: Dict[int, torch.Tensor] = {}
+        bsz, seq_len, n_heads, dim = v.shape
+        tree_size = self.cst.tree_size
 
-        for i in range(seq_len):
-            tree[self.leaf_start + i] = v[:, i, :, :].unsqueeze(2)  # K=1
+        # Dense tree storage.
+        tree = v.new_zeros(bsz, tree_size, n_heads, self.k_max, dim)
+        node_present = torch.zeros(tree_size, dtype=torch.bool, device=v.device)
 
-        for idx in range(self.leaf_start - 1, 0, -1):
-            left_idx = 2 * idx
-            right_idx = 2 * idx + 1
-            has_left = left_idx in tree
-            has_right = right_idx in tree
-            if not has_left and not has_right:
+        # Insert leaves (K=1).
+        leaf_start = self.leaf_start
+        leaf_end = leaf_start + seq_len
+        tree[:, leaf_start:leaf_end, :, :1, :] = v.unsqueeze(3)
+        node_present[leaf_start:leaf_end] = True
+
+        # Level-parallel bottom-up merge: one batched merge call per depth.
+        for d_from_leaf in range(1, self.log_n + 1):
+            d_from_root = self.log_n - d_from_leaf
+            node_start = 2 ** d_from_root
+            node_end = 2 ** (d_from_root + 1)
+            n_nodes = node_end - node_start
+            if n_nodes <= 0:
                 continue
 
-            depth = self.cst.depth_from_leaf(idx)
-            if has_left and has_right:
-                parent = self.gated_wave_merge(tree[left_idx], tree[right_idx], depth)
-            elif has_left:
-                parent = tree[left_idx]
-            else:
-                parent = tree[right_idx]
+            left_start = 2 * node_start
+            right_start = left_start + 1
 
-            tree[idx] = self._apply_cross_head_coupling(parent, depth)
+            left_idx = torch.arange(left_start, left_start + 2 * n_nodes, 2, device=v.device)
+            right_idx = left_idx + 1
+            has_left = node_present[left_idx]
+            has_right = node_present[right_idx]
+            has_any = has_left | has_right
+            if not bool(has_any.any()):
+                continue
+
+            k_child = k_at_depth(d_from_leaf - 1, self.k_max)
+            f_left = tree[:, left_start:left_start + 2 * n_nodes:2, :, :k_child, :]
+            f_right = tree[:, right_start:right_start + 2 * n_nodes:2, :, :k_child, :]
+
+            merged = self.gated_wave_merge.forward_batched(f_left, f_right, d_from_leaf)
+            k_parent = merged.shape[3]
+
+            parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
+            both = has_left & has_right
+            left_only = has_left & ~has_right
+            right_only = has_right & ~has_left
+
+            if bool(both.any()):
+                parent[:, both, :, :k_parent, :] = merged[:, both, :, :, :]
+            if bool(left_only.any()):
+                parent[:, left_only, :, :k_child, :] = f_left[:, left_only, :, :, :]
+            if bool(right_only.any()):
+                parent[:, right_only, :, :k_child, :] = f_right[:, right_only, :, :, :]
+
+            coupling = F.softmax(self.cross_head_coupling[d_from_leaf], dim=-1)
+            parent = torch.einsum("ij,bmjkd->bmikd", coupling, parent)
+
+            tree[:, node_start:node_end, :, :, :] = parent
+            node_present[node_start:node_end] = has_any
 
         return tree
+
+    def _get_local_mask(self, n_tokens: int, window: int, device: torch.device) -> torch.Tensor:
+        key = (n_tokens, window, str(device))
+        cached = self._local_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        rows = torch.arange(n_tokens, device=device).unsqueeze(1)
+        cols = torch.arange(n_tokens, device=device).unsqueeze(0)
+        mask = (cols < rows) & (cols >= rows - window)
+        self._local_mask_cache[key] = mask
+        return mask
 
     def _local_attention(self, q: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, n_heads, dim = q.shape
@@ -297,48 +394,93 @@ class DCWTv2Attention(nn.Module):
 
         k_local = self.k_local_proj(x).view(bsz, seq_len, n_heads, dim)
         v_local = self.v_local_proj(x).view(bsz, seq_len, n_heads, dim)
-        out = torch.zeros(bsz, seq_len, n_heads, dim, device=x.device, dtype=x.dtype)
 
-        scale = 1.0 / math.sqrt(dim)
-        for i in range(seq_len):
-            left = max(0, i - window)
-            right = i
-            if left >= right:
-                continue
-            q_i = q[:, i, :, :]
-            k_win = k_local[:, left:right, :, :]
-            v_win = v_local[:, left:right, :, :]
-            scores = torch.einsum("bhd,bkhd->bhk", q_i, k_win) * scale
-            weights = F.softmax(scores, dim=-1)
-            out[:, i, :, :] = torch.einsum("bhk,bkhd->bhd", weights, v_win)
+        # SDPA expects (B, H, N, D).
+        q_t = q.transpose(1, 2)
+        k_t = k_local.transpose(1, 2)
+        v_t = v_local.transpose(1, 2)
 
-        return out
+        local_mask = self._get_local_mask(seq_len, window, q.device)
+        attn_bias = torch.zeros(seq_len, seq_len, device=q.device, dtype=q_t.dtype)
+        attn_bias.masked_fill_(~local_mask, float("-inf"))
 
-    def _query_tree(self, q: torch.Tensor, tree: Dict[int, torch.Tensor]) -> torch.Tensor:
+        out = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=attn_bias,
+            dropout_p=0.0,
+            scale=1.0 / math.sqrt(dim),
+        )
+        out = torch.nan_to_num(out, nan=0.0)
+        return out.transpose(1, 2)
+
+    def _get_cover_table(
+        self, n_tokens: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (n_tokens, str(device))
+        cached = self._cover_table_cache.get(key)
+        if cached is not None:
+            return cached
+
+        max_cover = self.log_n + 1
+        node_indices = torch.full(
+            (n_tokens, max_cover), -1, dtype=torch.long, device=device
+        )
+        node_depths = torch.zeros((n_tokens, max_cover), dtype=torch.long, device=device)
+        valid_mask = torch.zeros((n_tokens, max_cover), dtype=torch.bool, device=device)
+
+        for pos in range(n_tokens):
+            cover = self.cst.cover_set_with_depth(pos)
+            for slot, (node_idx, depth) in enumerate(cover):
+                if slot >= max_cover:
+                    break
+                node_indices[pos, slot] = node_idx
+                node_depths[pos, slot] = depth
+                valid_mask[pos, slot] = True
+
+        self._cover_table_cache[key] = (node_indices, node_depths, valid_mask)
+        return node_indices, node_depths, valid_mask
+
+    def _query_tree(self, q: torch.Tensor, tree: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, n_heads, dim = q.shape
-        out = torch.zeros(bsz, seq_len, n_heads, dim, device=q.device, dtype=q.dtype)
+        _, _, _, _, k_dim = tree.shape
+        if k_dim != dim:
+            raise ValueError("Tree head dim mismatch in _query_tree.")
 
-        for i in range(seq_len):
-            cover = self.cst.cover_set_with_depth(i)
-            if not cover:
+        node_indices, node_depths, valid_mask = self._get_cover_table(seq_len, q.device)
+        max_cover = node_indices.shape[1]
+
+        node_indices_safe = node_indices.clamp(min=0)
+        f_nodes = tree[:, node_indices_safe, :, :, :]  # (B, N, L, H, K, D)
+
+        out = torch.zeros(bsz, seq_len, n_heads, dim, device=q.device, dtype=q.dtype)
+        q_flat = q.reshape(bsz * seq_len, n_heads, dim)
+
+        for depth in range(self.log_n + 1):
+            depth_mask = (node_depths == depth) & valid_mask
+            if not bool(depth_mask.any()):
                 continue
 
-            q_base = q[:, i, :, :]
-            node_out: List[torch.Tensor] = []
-            for node_idx, depth in cover:
-                if node_idx not in tree:
+            q_depth = self.ddq.get_query(q_flat, depth).view(bsz, seq_len, n_heads, dim)
+            scale = self.ddq.get_scale(depth)
+            k_depth = k_at_depth(depth, self.k_max)
+
+            for slot in range(max_cover):
+                active = depth_mask[:, slot]
+                if not bool(active.any()):
                     continue
-                f_node = tree[node_idx]  # (B, H, K, D)
-                q_depth = self.ddq.get_query(q_base, depth)  # (B, H, D)
-                scale = self.ddq.get_scale(depth)
-                scores = (q_depth.unsqueeze(2) * f_node).sum(-1) * scale
+
+                f_slot = f_nodes[:, :, slot, :, :k_depth, :]  # (B, N, H, K_d, D)
+                scores = (q_depth.unsqueeze(3) * f_slot).sum(-1) * scale
                 weights = F.softmax(scores, dim=-1)
-                node_out.append((weights.unsqueeze(-1) * f_node).sum(2))
+                attended = (weights.unsqueeze(-1) * f_slot).sum(3)
+                active_mask = active.view(1, seq_len, 1, 1).to(dtype=attended.dtype)
+                out = out + attended * active_mask
 
-            if node_out:
-                out[:, i, :, :] = torch.stack(node_out, dim=0).mean(dim=0)
-
-        return out
+        # Preserve the original behavior: mean over nodes in cover set.
+        counts = valid_mask.sum(dim=1).clamp(min=1).view(1, seq_len, 1, 1).to(out.dtype)
+        return out / counts
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         squeeze = False
@@ -586,6 +728,18 @@ class DCWTv2Transformer(nn.Module):
             ]
         )
 
+        if os.environ.get("DCWT_COMPILE", "1") == "1" and hasattr(torch, "compile"):
+            try:
+                for layer in self.layers:
+                    layer.attention.gated_wave_merge = torch.compile(
+                        layer.attention.gated_wave_merge,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                print("[DCWT-v2] torch.compile enabled on GatedWaveMerge")
+            except Exception as exc:
+                print(f"[DCWT-v2] torch.compile skipped: {exc}")
+
         self.norm = nn.LayerNorm(embedding_dim)
         self.output_projection = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.output_projection.weight = self.token_embedding.weight
@@ -640,4 +794,3 @@ __all__ = [
     "SinusoidalPositionalEncoding",
     "DCWTv2Transformer",
 ]
-

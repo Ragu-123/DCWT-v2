@@ -12,7 +12,6 @@ This module implements the architecture proposed in newproposal.txt:
 from __future__ import annotations
 
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -308,6 +307,7 @@ class DCWTv2Attention(nn.Module):
             max_depth=self.log_n,
             k_max=k_max,
         )
+        self.gated_wave_merge = torch.compile(self.gated_wave_merge, mode="reduce-overhead", fullgraph=False) if hasattr(torch, "compile") and torch.cuda.is_available() else self.gated_wave_merge
         self.ddq = DepthDecomposedQuery(num_heads, self.head_dim, self.log_n)
 
         self.cross_head_coupling = nn.ParameterList(
@@ -320,9 +320,11 @@ class DCWTv2Attention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self._local_mask_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
-        self._cover_table_cache: Dict[
+        self._cover_table_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._cover_table_overflow_cache: Dict[
             Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        self._cover_table_master = self._build_cover_table(self.max_seq_len, torch.device("cpu"))
 
     def _apply_cross_head_coupling(self, f: torch.Tensor, depth: int) -> torch.Tensor:
         coupling = F.softmax(self.cross_head_coupling[depth], dim=-1).to(f.dtype)  # (H, H)
@@ -373,9 +375,10 @@ class DCWTv2Attention(nn.Module):
             f_left = tree[:, left_start:left_start + 2 * n_nodes:2, :, :k_child, :]
             f_right = tree[:, right_start:right_start + 2 * n_nodes:2, :, :k_child, :]
 
-            merged = self.gated_wave_merge.forward_batched(
-                f_left, f_right, d_from_leaf
-            ).to(tree_dtype)
+            left_flat = f_left.reshape(bsz * n_nodes, n_heads, k_child, dim)
+            right_flat = f_right.reshape(bsz * n_nodes, n_heads, k_child, dim)
+            merged = self.gated_wave_merge(left_flat, right_flat, d_from_leaf)
+            merged = merged.reshape(bsz, n_nodes, n_heads, -1, dim).to(tree_dtype)
             k_parent = merged.shape[3]
 
             parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
@@ -481,14 +484,9 @@ class DCWTv2Attention(nn.Module):
         denominator = (q_phi * k_prefix).sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return (numerator / denominator).to(x.dtype)
 
-    def _get_cover_table(
+    def _build_cover_table(
         self, n_tokens: int, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        key = (n_tokens, str(device))
-        cached = self._cover_table_cache.get(key)
-        if cached is not None:
-            return cached
-
         max_cover = self.log_n + 1
         node_indices = torch.full(
             (n_tokens, max_cover), -1, dtype=torch.long, device=device
@@ -505,8 +503,25 @@ class DCWTv2Attention(nn.Module):
                 node_depths[pos, slot] = depth
                 valid_mask[pos, slot] = True
 
-        self._cover_table_cache[key] = (node_indices, node_depths, valid_mask)
         return node_indices, node_depths, valid_mask
+
+    def _get_cover_table(
+        self, n_tokens: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if n_tokens <= self.max_seq_len:
+            key = str(device)
+            cached = self._cover_table_cache.get(key)
+            if cached is None:
+                cached = tuple(t.to(device) for t in self._cover_table_master)
+                self._cover_table_cache[key] = cached
+            return cached[0][:n_tokens], cached[1][:n_tokens], cached[2][:n_tokens]
+
+        key = (n_tokens, str(device))
+        cached = self._cover_table_overflow_cache.get(key)
+        if cached is None:
+            cached = self._build_cover_table(n_tokens, device)
+            self._cover_table_overflow_cache[key] = cached
+        return cached
 
     def _query_tree(self, q: torch.Tensor, tree: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, n_heads, dim = q.shape
@@ -576,6 +591,27 @@ class DCWTv2Attention(nn.Module):
         if squeeze:
             out = out.squeeze(0)
         return out
+
+    def forward_incremental(
+        self, x_new: torch.Tensor, cache: "DCWTv2InferenceCache"
+    ) -> torch.Tensor:
+        if self.tree_mode != "full":
+            raise RuntimeError("Incremental cache path requires tree_mode='full'.")
+        if x_new.shape[:2] != (1, 1):
+            raise ValueError("forward_incremental expects x_new shape (1, 1, embedding_dim).")
+
+        q_new = self.q_proj(x_new).view(1, self.num_heads, self.head_dim)
+        v_new = self.v_proj(x_new).view(1, self.num_heads, self.head_dim)
+        cache.insert(
+            v_new,
+            self.gated_wave_merge,
+            coupling_fn=self._apply_cross_head_coupling,
+        )
+        out_heads = cache.query(q_new, self.ddq).unsqueeze(1)
+
+        out = out_heads.reshape(1, 1, self.embedding_dim)
+        out = out * torch.sigmoid(self.gate_proj(x_new))
+        return self.dropout(self.out_proj(out))
 
 
 class DCWTv2InferenceCache(nn.Module):
@@ -729,6 +765,13 @@ class DCWTv2TransformerLayer(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
+    def forward_incremental(
+        self, x_new: torch.Tensor, cache: DCWTv2InferenceCache
+    ) -> torch.Tensor:
+        x_new = x_new + self.dropout(self.attention.forward_incremental(self.norm1(x_new), cache))
+        x_new = x_new + self.ffn(self.norm2(x_new))
+        return x_new
+
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, dim: int, max_cache: int = 8192):
@@ -805,20 +848,6 @@ class DCWTv2Transformer(nn.Module):
             ]
         )
 
-        should_compile = os.environ.get("DCWT_COMPILE", "0") == "1"
-        can_compile = hasattr(torch, "compile") and torch.cuda.is_available() and not use_checkpoint
-        if should_compile and can_compile:
-            try:
-                for layer in self.layers:
-                    layer.attention.gated_wave_merge = torch.compile(
-                        layer.attention.gated_wave_merge,
-                        mode="reduce-overhead",
-                        fullgraph=False,
-                    )
-                print("[DCWT-v2] torch.compile enabled on GatedWaveMerge")
-            except Exception as exc:
-                print(f"[DCWT-v2] torch.compile skipped: {exc}")
-
         self.norm = nn.LayerNorm(embedding_dim)
         self.output_projection = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.output_projection.weight = self.token_embedding.weight
@@ -860,6 +889,157 @@ class DCWTv2Transformer(nn.Module):
                 ignore_index=-100,
             )
         return logits, loss
+
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        generated: torch.Tensor,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+        repetition_penalty: float,
+    ) -> torch.Tensor:
+        logits = logits / max(temperature, 1e-6)
+
+        if repetition_penalty != 1.0 and generated.numel() > 0:
+            for token_id in set(generated[0, -50:].tolist()):
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+
+        if top_k is not None and top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            threshold = torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+            logits = logits.masked_fill(logits < threshold, float("-inf"))
+
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_remove = cumulative_probs > top_p
+            sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+            sorted_remove[..., 0] = False
+            remove_mask = torch.zeros_like(logits, dtype=torch.bool)
+            remove_mask.scatter_(1, sorted_indices, sorted_remove)
+            logits = logits.masked_fill(remove_mask, float("-inf"))
+
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _generate_full_sequence(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+        repetition_penalty: float,
+    ) -> torch.Tensor:
+        generated = input_ids.clone()
+        for _ in range(max_new_tokens):
+            if generated.shape[1] >= self.max_seq_len:
+                break
+            logits, _ = self.forward(generated)
+            next_token = self._sample_next_token(
+                logits[:, -1, :],
+                generated,
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+            )
+            generated = torch.cat([generated, next_token], dim=1)
+        return generated
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: Optional[int] = 50,
+        top_p: Optional[float] = 0.9,
+        repetition_penalty: float = 1.2,
+    ) -> torch.Tensor:
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if input_ids.shape[0] != 1:
+            raise ValueError("generate currently supports batch size 1.")
+        if input_ids.shape[1] == 0:
+            raise ValueError("input_ids must contain at least one token.")
+
+        if input_ids.shape[1] > self.max_seq_len:
+            input_ids = input_ids[:, -self.max_seq_len:]
+
+        all_full_mode = all(layer.attention.tree_mode == "full" for layer in self.layers)
+        was_training = self.training
+        self.eval()
+        try:
+            if not all_full_mode:
+                return self._generate_full_sequence(
+                    input_ids,
+                    max_new_tokens,
+                    temperature,
+                    top_k,
+                    top_p,
+                    repetition_penalty,
+                )
+
+            generated = input_ids.clone()
+            device = generated.device
+            caches = [
+                DCWTv2InferenceCache(
+                    max_len=self.max_seq_len,
+                    num_heads=layer.attention.num_heads,
+                    head_dim=layer.attention.head_dim,
+                    k_max=layer.attention.k_max,
+                    local_window=layer.attention.local_window,
+                    device=device,
+                )
+                for layer in self.layers
+            ]
+
+            max_total_len = min(self.max_seq_len, generated.shape[1] + max_new_tokens)
+            pos_table = self.pos_encoding(max_total_len, device)
+            next_logits: Optional[torch.Tensor] = None
+
+            for pos in range(generated.shape[1]):
+                token = generated[:, pos : pos + 1]
+                x = self.token_embedding(token) + pos_table[pos].view(1, 1, -1)
+                x = self.dropout(x)
+                for layer, cache in zip(self.layers, caches):
+                    x = layer.forward_incremental(x, cache)
+                x = self.norm(x)
+                next_logits = self.output_projection(x)[:, 0, :]
+
+            if next_logits is None:
+                return generated
+
+            for _ in range(max_new_tokens):
+                if generated.shape[1] >= self.max_seq_len:
+                    break
+                next_token = self._sample_next_token(
+                    next_logits,
+                    generated,
+                    temperature,
+                    top_k,
+                    top_p,
+                    repetition_penalty,
+                )
+                generated = torch.cat([generated, next_token], dim=1)
+
+                pos = generated.shape[1] - 1
+                x = self.token_embedding(next_token) + pos_table[pos].view(1, 1, -1)
+                x = self.dropout(x)
+                for layer, cache in zip(self.layers, caches):
+                    x = layer.forward_incremental(x, cache)
+                x = self.norm(x)
+                next_logits = self.output_projection(x)[:, 0, :]
+
+            return generated
+        finally:
+            if was_training:
+                self.train()
 
 
 __all__ = [

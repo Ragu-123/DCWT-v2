@@ -1,81 +1,118 @@
-# DCWT-v2: Gated Multi-Vector Dyadic Causal Wave Tree
+# Wave Field LLM: HALE-First Architecture
 
-DCWT-v2 is the updated architecture for this repository. It replaces the V3.x field-convolution path with a causal tree attention system designed to address information-capacity collapse while preserving `O(n log n)` training complexity.
+This repository now uses **HALE** (Hierarchical Adaptive Linear-Enhanced Attention) as the default accelerated architecture, while keeping **DCWT-v2** available for compatibility and ablation.
 
-The full design rationale is captured in `newproposal.txt`.
+Reference research files:
+- `newPOC/HALE_RESEARCH.md`
+- `newPOC/hale_attention.py`
+- `newPOC/benchmark_hale.py`
 
-## What Changed
+## What Is Default Now
 
-The codebase now implements the five proposal fixes end-to-end:
+- **Primary model path**: `src/hale_attention.py` (`HALETransformer`, `HALEAttention`)
+- **Compatibility aliases**:
+  - `src/wave_field_transformer.py` -> `WaveFieldTransformer` aliases HALE
+  - `src/wave_field_attention.py` -> `WaveFieldAttention` aliases HALE
+- **Legacy model path**: `src/dcwt_v2.py` (still available)
 
-1. **Gated Wave Merge (GWM)**: content-adaptive gating during parent-node merge.
-2. **Multi-Vector Node Bank (MVNB)**: each internal node stores up to `K_max` vectors.
-3. **Complementary Dual Coverage (CDC)**: exact local window + compressed long-range tree retrieval.
-4. **Depth-Decomposed Queries (DDQ)**: depth-specific query projections and temperatures.
-5. **Tree LayerNorm + Skip**: normalization and stable skip paths in deep merges.
+## HALE Design Summary
 
-## Complexity
+HALE combines:
+1. Local causal SDPA window (exact short-range precision)
+2. Causal linear attention (ELU+1 feature map) for global memory
+3. Causal Haar multi-scale context
+4. Adaptive local/global gating
+5. Incremental generation cache (`O(d^2)`-state style updates per layer)
 
-- `tree_mode="full"`: `O(n log n)` training path with tree build/query.
-- `tree_mode="fast_hybrid"`: flash causal attention + linear global branch (`O(n)` global branch).
-- `tree_mode="flash_only"`: flash causal attention only (fastest wall-clock path).
-- Default in this repo is now `flash_only` for speed-first training.
-
-## Quick Start
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-PowerShell examples:
+PowerShell:
 
 ```powershell
 $env:PYTHONPATH='.;tokenizers'
-$env:DCWT_TREE_MODE='flash_only'   # fastest (target mode for quick runs)
-python benchmarks/wikitext2.py
-python benchmarks/train_dcwt_v2_bpe.py
-python benchmarks/train_dcwt_v2_100m.py
-python diagnostics/diagnose_physics.py
-python diagnostics/diagnose_bpe.py
-python tests/test_causality.py
-python tests/test_dcwt_v2.py
 ```
 
-To compare quality/speed tradeoffs:
+## Benchmark Entry Points
+
+### WikiText-2 comparison (Standard vs accelerated model)
 
 ```powershell
-$env:DCWT_TREE_MODE='fast_hybrid'  # flash + linear global memory
-# or:
-$env:DCWT_TREE_MODE='full'         # original tree path (slowest)
+$env:WFL_ACCEL_MODEL='hale'   # default; options: hale | dcwt
+python benchmarks/benchmark_wikitext2.py
+```
+
+### BPE benchmark
+
+```powershell
+$env:WFL_ACCEL_MODEL='hale'   # default; options: hale | dcwt
+python benchmarks/train_wave_v35_bpe.py
+```
+
+### 100M-scale benchmark
+
+```powershell
+$env:WFL_ACCEL_MODEL='hale'   # default; options: hale | dcwt
+python benchmarks/train_100m_bpe.py
+```
+
+### Dedicated HALE benchmark
+
+```powershell
+python benchmarks/benchmark_hale.py
+```
+
+## Configuration Knobs
+
+### HALE knobs
+
+```powershell
+$env:HALE_LOCAL_WINDOW='64'
+$env:HALE_NUM_HAAR_LEVELS='4'
+$env:HALE_CHUNK_SIZE='128'
+```
+
+### Optional DCWT bio-flow knobs (used only when `WFL_ACCEL_MODEL=dcwt`)
+
+```powershell
+$env:DCWT_BIO_FLOW='1'
+$env:DCWT_TREE_MODE='full'
+$env:DCWT_JACOBI_ITERS='2'
+$env:DCWT_DEPTH_COND_GWM='1'
+$env:DCWT_HAAR_INIT='1'
+$env:DCWT_HEARTBEAT='1'
+$env:DCWT_SLIME_MOLD='1'
 ```
 
 ## Project Structure
 
 ```text
 src/
-  dcwt_v2.py                 # Core DCWT-v2 implementation
-  wave_field_transformer.py  # Backward-compatible alias to DCWT-v2
-  wave_field_attention.py    # Backward-compatible alias to DCWT-v2 attention
+  hale_attention.py           # HALE architecture (default)
+  dcwt_v2.py                  # DCWT-v2 architecture (legacy/ablation)
+  wave_field_transformer.py   # Compatibility alias to HALE
+  wave_field_attention.py     # Compatibility alias to HALE
 benchmarks/
-  wikitext2.py               # WikiText-2 benchmark entrypoint
-  benchmark_wikitext2.py     # Standard vs DCWT-v2 benchmark
-  train_wave_v35_bpe.py      # BPE benchmark (kept filename, now DCWT-v2)
-  train_dcwt_v2_bpe.py       # Alias entrypoint for DCWT-v2 BPE benchmark
-  train_100m_bpe.py          # 100M-scale BPE benchmark (DCWT-v2)
-  train_dcwt_v2_100m.py      # Alias entrypoint for DCWT-v2 100M benchmark
+  benchmark_wikitext2.py      # Standard vs accelerated (HALE default)
+  train_wave_v35_bpe.py       # BPE benchmark (HALE default)
+  train_100m_bpe.py           # 100M benchmark (HALE default)
+  benchmark_hale.py           # Dedicated HALE comparison script
+  wikitext2.py                # Convenience entrypoint
 diagnostics/
-  diagnose_physics.py        # DCWT-v2 structural diagnostics
-  diagnose_bpe.py            # DCWT-v2 BPE diagnostics
+  diagnose_bpe.py
 tests/
-  test_causality.py          # Future-token leak regression
-  test_dcwt_v2.py            # Structural smoke tests
+  test_causality.py
+  test_dcwt_v2.py
 ```
 
 ## Compatibility Notes
 
-- Existing imports such as `from src.wave_field_transformer import WaveFieldTransformer` still work.
-- Legacy constructor args (`field_size`, `interference_interval`, `device`) are accepted for compatibility, but DCWT-v2 uses `k_max` and `local_window` for its core behavior.
+- Existing imports like `from src.wave_field_transformer import WaveFieldTransformer` still work.
+- Existing DCWT scripts remain usable by setting `WFL_ACCEL_MODEL=dcwt`.
 
 ## License
 
-This project is licensed under AGPL-3.0. See `LICENSE`.
+AGPL-3.0 (see `LICENSE`).

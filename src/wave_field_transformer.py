@@ -1,7 +1,7 @@
 """
 Backward-compatible transformer entrypoint.
 
-The project now defaults to DCWT-v2. This module preserves historical
+The project now defaults to HALE. This module preserves historical
 `WaveFieldTransformer` imports and call signatures used by existing scripts.
 """
 
@@ -17,6 +17,12 @@ from .dcwt_v2 import (
     GatedWaveMerge,
     SinusoidalPositionalEncoding,
     k_at_depth,
+)
+from .hale_attention import (
+    HALEAttention,
+    HALEInferenceCache,
+    HALETransformer,
+    HALETransformerLayer,
 )
 
 
@@ -36,9 +42,9 @@ class FieldInterferenceModule(nn.Module):
         return x
 
 
-class WaveFieldTransformer(DCWTv2Transformer):
+class WaveFieldTransformer(HALETransformer):
     """
-    Compatibility alias to DCWT-v2 transformer.
+    Compatibility alias to HALE transformer.
 
     Keeps old keyword arguments (`field_size`, `interference_interval`, `device`)
     accepted for scripts that were written for Wave Field V3.x.
@@ -59,6 +65,8 @@ class WaveFieldTransformer(DCWTv2Transformer):
         device=None,
         k_max=8,
         local_window=32,
+        num_haar_levels=4,
+        chunk_size=128,
     ):
         super().__init__(
             vocab_size=vocab_size,
@@ -67,10 +75,11 @@ class WaveFieldTransformer(DCWTv2Transformer):
             num_heads=num_heads,
             ffn_dim=ffn_dim,
             max_seq_len=max_seq_len,
-            k_max=k_max,
             local_window=local_window,
             dropout=dropout,
             use_checkpoint=use_checkpoint,
+            num_haar_levels=num_haar_levels,
+            chunk_size=chunk_size,
             field_size=field_size,
             interference_interval=interference_interval,
             device=device,
@@ -80,6 +89,10 @@ class WaveFieldTransformer(DCWTv2Transformer):
 __all__ = [
     "WaveFieldTransformer",
     "FieldInterferenceModule",
+    "HALEAttention",
+    "HALETransformer",
+    "HALETransformerLayer",
+    "HALEInferenceCache",
     "DCWTv2Attention",
     "DCWTv2Transformer",
     "DCWTv2TransformerLayer",

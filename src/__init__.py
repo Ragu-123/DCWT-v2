@@ -1,8 +1,8 @@
 """
-Wave Field LLM / DCWT-v2 package exports.
+Wave Field LLM package exports.
 """
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
 from .causal_field_attention import CausalFieldAttentionV2
 from .causal_field_transformer import CausalFieldTransformer
@@ -21,6 +21,16 @@ from .dcwt_v2 import (
 from .bio_init import init_all_depths_haar, init_gwm_haar
 from .bio_scheduler import SlimeMoldKScheduler, heartbeat_schedule, set_gwm_depth_frozen
 from .global_context import GlobalContextModule
+from .hale_attention import (
+    AdaptiveReasoningGate,
+    CausalHaarContext,
+    HALEAttention,
+    HALEInferenceCache,
+    HALETransformer,
+    HALETransformerLayer,
+    causal_linear_attention,
+    causal_linear_attention_chunked,
+)
 from .wave_field_attention import WaveFieldAttention
 from .wave_field_transformer import FieldInterferenceModule, WaveFieldTransformer
 
@@ -31,6 +41,14 @@ __all__ = [
     "WaveFieldAttention",
     "WaveFieldTransformer",
     "FieldInterferenceModule",
+    "HALEAttention",
+    "HALETransformer",
+    "HALETransformerLayer",
+    "HALEInferenceCache",
+    "CausalHaarContext",
+    "AdaptiveReasoningGate",
+    "causal_linear_attention",
+    "causal_linear_attention_chunked",
     "CausalSegmentTree",
     "DCWTv2Attention",
     "DCWTv2InferenceCache",

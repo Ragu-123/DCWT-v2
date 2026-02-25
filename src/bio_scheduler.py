@@ -50,6 +50,12 @@ def set_gwm_depth_frozen(
                 _set_requires_grad(gwm.skip_proj[depth], enabled)
                 gwm.parent_query_init[depth].requires_grad = enabled
                 gwm.skip_alpha[depth].requires_grad = enabled
+
+            # Shared wave parameters are global across depths.
+            wave_enabled = len(unfreeze_set) > 0
+            gwm.wave_freq_base.requires_grad = wave_enabled
+            gwm.wave_damp_base.requires_grad = wave_enabled
+            gwm.wave_phase_base.requires_grad = wave_enabled
             continue
 
         if isinstance(gwm, DepthConditionedGWM):

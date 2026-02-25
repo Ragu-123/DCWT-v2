@@ -1,7 +1,8 @@
 """
-DCWT-v2 + BPE Tokenizer — WikiText-2 Benchmark
-==============================================
-Byte-level BPE benchmark for Standard Transformer vs DCWT-v2.
+HALE + BPE Tokenizer — WikiText-2 Benchmark
+===========================================
+Byte-level BPE benchmark for Standard Transformer vs accelerated architecture.
+Defaults to HALE, with optional DCWT-v2 fallback.
 """
 
 import torch
@@ -15,6 +16,7 @@ from typing import Any, Dict, Optional
 from torch.utils.data import DataLoader, Dataset
 
 from src.dcwt_v2 import DCWTv2Transformer
+from src.hale_attention import HALETransformer
 from src.bio_scheduler import SlimeMoldKScheduler, heartbeat_schedule
 
 
@@ -218,6 +220,10 @@ def _is_dcwt_model(model: nn.Module) -> bool:
     return isinstance(model, DCWTv2Transformer)
 
 
+def _is_hale_model(model: nn.Module) -> bool:
+    return isinstance(model, HALETransformer)
+
+
 def _model_forward(
     model: nn.Module,
     x: torch.Tensor,
@@ -268,16 +274,20 @@ def generate_text(model, tok, seed, device, max_tokens=60,
     if not ids:
         return seed + " [empty]"
     bio_cfg = bio_cfg or {}
-    if _is_dcwt_model(model):
+    if _is_dcwt_model(model) or _is_hale_model(model):
         inp = torch.tensor(ids, device=device).unsqueeze(0)
-        out = model.generate(
-            inp,
+        gen_kwargs = dict(
             max_new_tokens=max_tokens,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=rep_penalty,
-            jacobi_iters=int(bio_cfg.get("jacobi_iters", 0)),
+        )
+        if _is_dcwt_model(model):
+            gen_kwargs["jacobi_iters"] = int(bio_cfg.get("jacobi_iters", 0))
+        out = model.generate(
+            inp,
+            **gen_kwargs,
         )
         model.train()
         return tok.decode(out[0].tolist())
@@ -436,9 +446,21 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
 # ======================================================================
 
 def main():
-    bio_enabled = _env_flag("DCWT_BIO_FLOW", True)
+    accel_model = os.environ.get("WFL_ACCEL_MODEL", "hale").strip().lower()
+    if accel_model not in {"hale", "dcwt"}:
+        print(f"  Unknown WFL_ACCEL_MODEL={accel_model!r}; defaulting to 'hale'.")
+        accel_model = "hale"
+    use_dcwt = accel_model == "dcwt"
+
+    hale_cfg: Dict[str, Any] = {
+        "local_window": int(os.environ.get("HALE_LOCAL_WINDOW", "64")),
+        "num_haar_levels": int(os.environ.get("HALE_NUM_HAAR_LEVELS", "4")),
+        "chunk_size": int(os.environ.get("HALE_CHUNK_SIZE", "128")),
+    }
+
+    bio_enabled = _env_flag("DCWT_BIO_FLOW", True) if use_dcwt else False
     dcwt_tree_mode = os.environ.get("DCWT_TREE_MODE", "full" if bio_enabled else "flash_only")
-    if bio_enabled and dcwt_tree_mode != "full":
+    if use_dcwt and bio_enabled and dcwt_tree_mode != "full":
         print("  Bio flow requires tree_mode='full'; overriding requested tree_mode.")
         dcwt_tree_mode = "full"
     bio_cfg: Dict[str, Any] = {
@@ -455,22 +477,32 @@ def main():
         "slime_start_step": int(os.environ.get("DCWT_SLIME_START_STEP", "8000")),
         "compile_gwm": _env_flag("DCWT_COMPILE_GWM", True),
     }
-    if not bio_enabled:
-        bio_cfg["jacobi_iters"] = 0
+    model2_name = "DCWT-v2" if use_dcwt else "HALE"
+    model2_save_dir = "bpe_dcwt_v2_checkpoints" if use_dcwt else "bpe_hale_checkpoints"
+    model2_results_path = "bpe_dcwt_v2_results.json" if use_dcwt else "bpe_hale_results.json"
+    model2_complexity = "O(n log n)" if use_dcwt else "O(n·w + n·d^2)"
 
     print("=" * 65)
-    print("  DCWT-v2 + BPE TOKENIZER")
-    print("  Standard Transformer vs DCWT-v2 — fair BPE comparison")
-    print(f"  DCWT tree_mode: {dcwt_tree_mode}")
-    print(
-        "  Bio flow:"
-        f" enabled={bio_cfg['enabled']}"
-        f" depth_cond_gwm={bio_cfg['use_depth_conditioned_gwm']}"
-        f" haar={bio_cfg['use_haar_init']}"
-        f" jacobi_iters={bio_cfg['jacobi_iters']}"
-        f" heartbeat={bio_cfg['use_heartbeat']}"
-        f" slime={bio_cfg['use_slime_mold']}"
-    )
+    print("  HALE + BPE TOKENIZER")
+    print(f"  Standard Transformer vs {model2_name} — fair BPE comparison")
+    if use_dcwt:
+        print(f"  DCWT tree_mode: {dcwt_tree_mode}")
+        print(
+            "  Bio flow:"
+            f" enabled={bio_cfg['enabled']}"
+            f" depth_cond_gwm={bio_cfg['use_depth_conditioned_gwm']}"
+            f" haar={bio_cfg['use_haar_init']}"
+            f" jacobi_iters={bio_cfg['jacobi_iters']}"
+            f" heartbeat={bio_cfg['use_heartbeat']}"
+            f" slime={bio_cfg['use_slime_mold']}"
+        )
+    else:
+        print(
+            "  HALE config:"
+            f" local_window={hale_cfg['local_window']}"
+            f" haar_levels={hale_cfg['num_haar_levels']}"
+            f" chunk_size={hale_cfg['chunk_size']}"
+        )
     print("=" * 65)
 
     splits = load_wikitext2()
@@ -574,44 +606,66 @@ def main():
     torch.cuda.empty_cache()
 
     # ============================================================
-    # MODEL 2: DCWT-v2
+    # MODEL 2: Accelerated architecture (HALE default)
     # ============================================================
     print(f"\n{'='*65}")
-    print(f"  MODEL 2: DCWT-v2 ({dcwt_tree_mode})")
+    print(f"  MODEL 2: {model2_name}")
     print(f"{'='*65}")
 
-    wave_model = DCWTv2Transformer(
-        vocab_size=vocab_size,
-        embedding_dim=256,
-        num_layers=6,
-        num_heads=8,
-        ffn_dim=1024,
-        max_seq_len=max_seq_len + 1,
-        k_max=8,
-        local_window=32,
-        tree_mode=dcwt_tree_mode,
-        dropout=0.1,
-        use_checkpoint=False,
-        use_depth_conditioned_gwm=bool(bio_cfg["use_depth_conditioned_gwm"]),
-        depth_embed_dim=int(bio_cfg["depth_embed_dim"]),
-        compile_gwm=bool(bio_cfg["compile_gwm"]),
-        use_haar_init=bool(bio_cfg["use_haar_init"]),
-    ).to(device)
+    if use_dcwt:
+        wave_model = DCWTv2Transformer(
+            vocab_size=vocab_size,
+            embedding_dim=256,
+            num_layers=6,
+            num_heads=8,
+            ffn_dim=1024,
+            max_seq_len=max_seq_len + 1,
+            k_max=8,
+            local_window=32,
+            tree_mode=dcwt_tree_mode,
+            dropout=0.1,
+            use_checkpoint=False,
+            use_depth_conditioned_gwm=bool(bio_cfg["use_depth_conditioned_gwm"]),
+            depth_embed_dim=int(bio_cfg["depth_embed_dim"]),
+            compile_gwm=bool(bio_cfg["compile_gwm"]),
+            use_haar_init=bool(bio_cfg["use_haar_init"]),
+        ).to(device)
+    else:
+        wave_model = HALETransformer(
+            vocab_size=vocab_size,
+            embedding_dim=256,
+            num_layers=6,
+            num_heads=8,
+            ffn_dim=1024,
+            max_seq_len=max_seq_len + 1,
+            local_window=int(hale_cfg["local_window"]),
+            num_haar_levels=int(hale_cfg["num_haar_levels"]),
+            chunk_size=int(hale_cfg["chunk_size"]),
+            dropout=0.1,
+            use_checkpoint=False,
+        ).to(device)
 
     wave_result = train_model(
         wave_model, train_data, val_data, tok, vocab_size, device,
-        "DCWT-v2", num_epochs=num_epochs, batch_size=batch_size,
+        model2_name, num_epochs=num_epochs, batch_size=batch_size,
         grad_accum=grad_accum, peak_lr=peak_lr, use_amp=use_amp,
         autocast_device=autocast_device, autocast_dtype=autocast_dtype,
-        save_dir="bpe_dcwt_v2_checkpoints",
-        bio_cfg=bio_cfg,
+        save_dir=model2_save_dir,
+        bio_cfg=bio_cfg if use_dcwt else {"enabled": False},
     )
     results.append(wave_result)
 
-    print(f"\n  --- DCWT-v2 Generation ---")
+    print(f"\n  --- {model2_name} Generation ---")
     for seed in ["The president of the", "In the year", "Scientists discovered that",
                  "The city of New York", "He was born in"]:
-        text = generate_text(wave_model, tok, seed, device, max_tokens=40, bio_cfg=bio_cfg)
+        text = generate_text(
+            wave_model,
+            tok,
+            seed,
+            device,
+            max_tokens=40,
+            bio_cfg=bio_cfg if use_dcwt else {"enabled": False},
+        )
         print(f"  [{seed}] -> {text}")
 
     test_loader = create_dataloader(test_data, batch_size=batch_size, shuffle=False)
@@ -623,7 +677,7 @@ def main():
         use_amp=use_amp,
         autocast_device=autocast_device,
         autocast_dtype=autocast_dtype,
-        bio_cfg=bio_cfg,
+        bio_cfg=bio_cfg if use_dcwt else {"enabled": False},
     )
     wave_result['test_ppl'] = wave_tp
     wave_result['test_acc'] = wave_ta
@@ -639,30 +693,30 @@ def main():
     print("  BPE BENCHMARK RESULTS")
     print(f"{'='*65}")
 
-    print(f"\n  {'Metric':<20} {'Std Transformer':>18} {'DCWT-v2':>18} {'Winner':>10}")
+    print(f"\n  {'Metric':<20} {'Std Transformer':>18} {model2_name:>18} {'Winner':>10}")
     print(f"  {'-'*20} {'-'*18} {'-'*18} {'-'*10}")
 
     s_tp, w_tp = results[0]['test_ppl'], results[1]['test_ppl']
     s_ta, w_ta = results[0]['test_acc'], results[1]['test_acc']
 
-    winner_p = "DCWT-v2" if w_tp < s_tp else "Standard"
-    winner_a = "DCWT-v2" if w_ta > s_ta else "Standard"
+    winner_p = model2_name if w_tp < s_tp else "Standard"
+    winner_a = model2_name if w_ta > s_ta else "Standard"
     print(f"  {'Test PPL':<20} {s_tp:>18.1f} {w_tp:>18.1f} {winner_p:>10}")
     print(f"  {'Test Accuracy':<20} {s_ta:>17.1f}% {w_ta:>17.1f}% {winner_a:>10}")
     print(f"  {'Parameters':<20} {results[0]['params']:>18,} {results[1]['params']:>18,}")
     print(f"  {'Train Time':<20} {results[0]['total_time']/60:>17.1f}m {results[1]['total_time']/60:>17.1f}m")
-    print(f"  {'Complexity':<20} {'O(n^2)':>18} {'O(n log n)':>18}")
+    print(f"  {'Complexity':<20} {'O(n^2)':>18} {model2_complexity:>18}")
     print(f"  {'Tokenizer':<20} {'BPE '+str(vocab_size):>18} {'BPE '+str(vocab_size):>18}")
     print(f"  {'Seq Length':<20} {max_seq_len:>18} {max_seq_len:>18}")
 
     if w_tp < s_tp:
         pct = (s_tp - w_tp) / s_tp * 100
-        print(f"\n  DCWT-v2 BEATS Standard Transformer by {pct:.1f}% on test PPL!")
+        print(f"\n  {model2_name} BEATS Standard Transformer by {pct:.1f}% on test PPL!")
     else:
         pct = (w_tp - s_tp) / s_tp * 100
-        print(f"\n  Standard beats DCWT-v2 by {pct:.1f}% — but DCWT-v2 uses O(n log n)")
+        print(f"\n  Standard beats {model2_name} by {pct:.1f}% — but {model2_name} uses {model2_complexity}")
 
-    with open("bpe_dcwt_v2_results.json", 'w') as f:
+    with open(model2_results_path, 'w') as f:
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*65}")

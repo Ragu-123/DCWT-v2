@@ -11,6 +11,7 @@ This module implements the architecture proposed in newproposal.txt:
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -69,6 +70,35 @@ class CausalSegmentTree:
             r_idx >>= 1
 
         return out
+
+
+@functools.lru_cache(maxsize=16)
+def _get_tree_structure(
+    max_len: int, device_str: str
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Cached internal tree connectivity for Jacobi updates.
+
+    Returns:
+    - node_idx: internal node indices
+    - left_idx: left child index per internal node
+    - right_idx: right child index per internal node
+    - depth_idx: depth-from-leaf per internal node
+    """
+    cst = CausalSegmentTree(max_len)
+    leaf_start = cst.leaf_start
+    internals = list(range(1, leaf_start))
+    lefts = [2 * n for n in internals]
+    rights = [2 * n + 1 for n in internals]
+    depths = [cst.depth_from_leaf(n) for n in internals]
+
+    device = torch.device(device_str)
+    return (
+        torch.tensor(internals, dtype=torch.long, device=device),
+        torch.tensor(lefts, dtype=torch.long, device=device),
+        torch.tensor(rights, dtype=torch.long, device=device),
+        torch.tensor(depths, dtype=torch.long, device=device),
+    )
 
 
 class GatedWaveMerge(nn.Module):
@@ -225,6 +255,146 @@ class GatedWaveMerge(nn.Module):
         return merged_flat.reshape(bsz, n_nodes, n_heads, k_parent, dim)
 
 
+class DepthConditionedGWM(nn.Module):
+    """
+    Shared GWM conditioned on depth embedding.
+
+    Input:
+      - f_left:  (B, H, K_left, D)
+      - f_right: (B, H, K_right, D)
+      - depth:   depth-from-leaf
+    Output:
+      - f_parent: (B, H, K_parent, D)
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        k_max: int,
+        max_depth: int,
+        depth_embed_dim: int = 32,
+    ):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("DCWT-v2 requires even head_dim for complex wave rotation.")
+
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.k_max = k_max
+        self.max_depth = max_depth
+        self.depth_embed_dim = depth_embed_dim
+
+        input_dim = 2 * head_dim + depth_embed_dim
+        self.gate_left = nn.Linear(input_dim, head_dim, bias=True)
+        self.gate_right = nn.Linear(input_dim, head_dim, bias=True)
+        self.parent_query_base = nn.Parameter(torch.randn(k_max, head_dim) * 0.02)
+        self.query_offset = nn.Linear(depth_embed_dim, k_max * head_dim, bias=True)
+        self.layer_norm = nn.LayerNorm(head_dim)
+        self.skip_proj = nn.Linear(head_dim, head_dim, bias=False)
+        self.skip_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+        self.wave_freq_base = nn.Parameter(torch.linspace(0.3, 4.0, num_heads))
+        self.wave_damp_base = nn.Parameter(torch.linspace(-3.0, 0.5, num_heads))
+        self.wave_phase_base = nn.Parameter(torch.linspace(0.0, math.pi, num_heads))
+
+        nn.init.zeros_(self.gate_left.weight)
+        nn.init.constant_(self.gate_left.bias, 0.5)
+        nn.init.zeros_(self.gate_right.weight)
+        nn.init.constant_(self.gate_right.bias, 0.5)
+        nn.init.zeros_(self.query_offset.weight)
+        nn.init.zeros_(self.query_offset.bias)
+
+        depth_embed = self._make_sin_embed(max_depth + 1, depth_embed_dim)
+        self.register_buffer("depth_embed", depth_embed, persistent=False)
+
+    @staticmethod
+    def _make_sin_embed(n: int, d_model: int) -> torch.Tensor:
+        pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+        inv = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / max(d_model, 1))
+        )
+        embed = torch.zeros(n, d_model, dtype=torch.float32)
+        embed[:, 0::2] = torch.sin(pos * inv)
+        embed[:, 1::2] = torch.cos(pos * inv)
+        return embed
+
+    def _rotate_right(self, f: torch.Tensor, depth: int) -> torch.Tensor:
+        alpha_base = F.softplus(self.wave_damp_base)  # (H,)
+        omega_base = self.wave_freq_base
+        phi_base = self.wave_phase_base
+
+        scale = max(2 ** (self.max_depth - depth), 1)
+        delta_t = float(scale)
+        alpha_d = alpha_base / scale
+        omega_d = omega_base / scale
+        phi_d = phi_base + depth * (math.pi / 4.0)
+
+        decay = torch.exp(-alpha_d * delta_t)
+        phi_real = decay * torch.cos(omega_d * delta_t + phi_d)
+        phi_imag = decay * torch.sin(omega_d * delta_t + phi_d)
+
+        if TRITON_AVAILABLE and f.is_cuda:
+            try:
+                from .triton_wave_rotate import wave_rotate_triton
+
+                return wave_rotate_triton(f, phi_real, phi_imag)
+            except Exception:
+                pass
+
+        d2 = self.head_dim // 2
+        f_re = f[..., :d2]
+        f_im = f[..., d2:]
+        if f.dim() != 4:
+            raise ValueError(f"Unexpected tensor rank for rotation: {f.dim()}")
+
+        pr = phi_real.view(1, self.num_heads, 1, 1)
+        pi_ = phi_imag.view(1, self.num_heads, 1, 1)
+        rot_re = pr * f_re - pi_ * f_im
+        rot_im = pi_ * f_re + pr * f_im
+        return torch.cat([rot_re, rot_im], dim=-1)
+
+    def forward(self, f_left: torch.Tensor, f_right: torch.Tensor, depth: int) -> torch.Tensor:
+        bsz, n_heads, k_left, dim = f_left.shape
+        _, _, k_right, _ = f_right.shape
+        if n_heads != self.num_heads or dim != self.head_dim:
+            raise ValueError("Unexpected tensor shape in DepthConditionedGWM.")
+
+        rotated_right = self._rotate_right(f_right, depth)
+        k_parent = min(k_left + k_right, self.k_max)
+
+        left_mean = f_left.mean(dim=2)
+        right_mean = rotated_right.mean(dim=2)
+        depth_vec = self.depth_embed[depth].to(left_mean.dtype)
+        depth_vec = depth_vec.view(1, 1, -1).expand(bsz, n_heads, -1)
+
+        gate_in = torch.cat([left_mean, right_mean, depth_vec], dim=-1)
+        gate_in_flat = gate_in.reshape(bsz * n_heads, -1)
+        g_l = torch.sigmoid(self.gate_left(gate_in_flat)).view(bsz, n_heads, 1, dim)
+        g_r = torch.sigmoid(self.gate_right(gate_in_flat)).view(bsz, n_heads, 1, dim)
+
+        bank = torch.cat([f_left * g_l, rotated_right * g_r], dim=2)
+
+        q_offset = self.query_offset(depth_vec[0, 0]).view(self.k_max, dim).to(bank.dtype)
+        parent_q = self.parent_query_base[:k_parent].to(bank.dtype) + q_offset[:k_parent]
+        parent_q = parent_q.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)
+
+        attn = torch.einsum("bhqd,bhkd->bhqk", parent_q, bank) / math.sqrt(dim)
+        attn = F.softmax(attn, dim=-1)
+        parent_raw = torch.einsum("bhqk,bhkd->bhqd", attn, bank)
+
+        parent_norm = self.layer_norm(parent_raw.reshape(bsz * n_heads * k_parent, dim))
+        parent_norm = parent_norm.view(bsz, n_heads, k_parent, dim)
+
+        skip = self.skip_proj(left_mean.reshape(bsz * n_heads, dim)).view(bsz, n_heads, 1, dim)
+        alpha = torch.sigmoid(self.skip_alpha)
+        out = parent_norm + alpha * skip
+        if out.dtype != f_left.dtype:
+            out = out.to(f_left.dtype)
+        return out
+
+
 class DepthDecomposedQuery(nn.Module):
     """Depth-specific query projections and learnable depth temperatures."""
 
@@ -263,6 +433,9 @@ class DCWTv2Attention(nn.Module):
         local_window: int = 32,
         tree_mode: str = "flash_only",
         dropout: float = 0.1,
+        use_depth_conditioned_gwm: bool = False,
+        depth_embed_dim: int = 32,
+        compile_gwm: bool = True,
     ):
         super().__init__()
         if embedding_dim % num_heads != 0:
@@ -274,6 +447,7 @@ class DCWTv2Attention(nn.Module):
         self.max_seq_len = max_seq_len
         self.k_max = k_max
         self.local_window = local_window
+        self.use_depth_conditioned_gwm = use_depth_conditioned_gwm
         if tree_mode not in {"full", "local_only", "fast_hybrid", "flash_only"}:
             raise ValueError(
                 "tree_mode must be one of: {'full', 'local_only', 'fast_hybrid', 'flash_only'}"
@@ -301,13 +475,30 @@ class DCWTv2Attention(nn.Module):
         self.log_n = self.cst.log_n
         self.leaf_start = self.cst.leaf_start
 
-        self.gated_wave_merge = GatedWaveMerge(
-            num_heads=num_heads,
-            head_dim=self.head_dim,
-            max_depth=self.log_n,
-            k_max=k_max,
-        )
-        self.gated_wave_merge = torch.compile(self.gated_wave_merge, mode="reduce-overhead", fullgraph=False) if hasattr(torch, "compile") and torch.cuda.is_available() else self.gated_wave_merge
+        if self.use_depth_conditioned_gwm:
+            self.gated_wave_merge = DepthConditionedGWM(
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                k_max=k_max,
+                max_depth=self.log_n,
+                depth_embed_dim=depth_embed_dim,
+            )
+        else:
+            self.gated_wave_merge = GatedWaveMerge(
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                max_depth=self.log_n,
+                k_max=k_max,
+            )
+        if compile_gwm and hasattr(torch, "compile") and torch.cuda.is_available():
+            try:
+                self.gated_wave_merge = torch.compile(
+                    self.gated_wave_merge,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+            except Exception:
+                pass
         self.ddq = DepthDecomposedQuery(num_heads, self.head_dim, self.log_n)
 
         self.cross_head_coupling = nn.ParameterList(
@@ -325,10 +516,67 @@ class DCWTv2Attention(nn.Module):
             Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
         self._cover_table_master = self._build_cover_table(self.max_seq_len, torch.device("cpu"))
+        self.k_current: Dict[int, int] = {
+            d: k_at_depth(d, self.k_max) for d in range(self.log_n + 1)
+        }
 
     def _apply_cross_head_coupling(self, f: torch.Tensor, depth: int) -> torch.Tensor:
         coupling = F.softmax(self.cross_head_coupling[depth], dim=-1).to(f.dtype)  # (H, H)
         return torch.einsum("ij,bjkd->bikd", coupling, f).to(f.dtype)
+
+    def _k_at_depth(self, depth: int) -> int:
+        return int(self.k_current.get(depth, k_at_depth(depth, self.k_max)))
+
+    def set_k_schedule(self, k_schedule: Dict[int, int]) -> None:
+        updated: Dict[int, int] = {}
+        for d in range(self.log_n + 1):
+            target = int(k_schedule.get(d, self._k_at_depth(d)))
+            updated[d] = max(1, min(self.k_max, target))
+        self.k_current = updated
+
+    def get_tree_grad_norms(self) -> Dict[int, float]:
+        out: Dict[int, float] = {}
+        for d in range(self.log_n + 1):
+            norms: List[float] = []
+
+            coupling_grad = self.cross_head_coupling[d].grad
+            if coupling_grad is not None:
+                norms.append(float(coupling_grad.norm().item()))
+
+            ddq_grad = self.ddq.depth_proj[d].weight.grad
+            if ddq_grad is not None:
+                norms.append(float(ddq_grad.norm().item()))
+
+            if isinstance(self.gated_wave_merge, GatedWaveMerge):
+                for tensor in [
+                    self.gated_wave_merge.gate_left[d].weight.grad,
+                    self.gated_wave_merge.gate_left[d].bias.grad,
+                    self.gated_wave_merge.gate_right[d].weight.grad,
+                    self.gated_wave_merge.gate_right[d].bias.grad,
+                    self.gated_wave_merge.parent_query_init[d].grad,
+                    self.gated_wave_merge.skip_alpha[d].grad,
+                    self.gated_wave_merge.skip_proj[d].weight.grad,
+                ]:
+                    if tensor is not None:
+                        norms.append(float(tensor.norm().item()))
+            else:
+                for tensor in [
+                    self.gated_wave_merge.gate_left.weight.grad,
+                    self.gated_wave_merge.gate_left.bias.grad,
+                    self.gated_wave_merge.gate_right.weight.grad,
+                    self.gated_wave_merge.gate_right.bias.grad,
+                    self.gated_wave_merge.parent_query_base.grad,
+                    self.gated_wave_merge.query_offset.weight.grad,
+                    self.gated_wave_merge.query_offset.bias.grad,
+                    self.gated_wave_merge.skip_alpha.grad,
+                    self.gated_wave_merge.skip_proj.weight.grad,
+                ]:
+                    if tensor is not None:
+                        norms.append(float(tensor.norm().item()))
+
+            if norms:
+                out[d] = sum(norms) / len(norms)
+        return out
 
     def _build_tree_training(self, v: torch.Tensor) -> torch.Tensor:
         """
@@ -371,7 +619,7 @@ class DCWTv2Attention(nn.Module):
             if not bool(has_any.any()):
                 continue
 
-            k_child = k_at_depth(d_from_leaf - 1, self.k_max)
+            k_child = self._k_at_depth(d_from_leaf - 1)
             f_left = tree[:, left_start:left_start + 2 * n_nodes:2, :, :k_child, :]
             f_right = tree[:, right_start:right_start + 2 * n_nodes:2, :, :k_child, :]
 
@@ -379,7 +627,7 @@ class DCWTv2Attention(nn.Module):
             right_flat = f_right.reshape(bsz * n_nodes, n_heads, k_child, dim)
             merged = self.gated_wave_merge(left_flat, right_flat, d_from_leaf)
             merged = merged.reshape(bsz, n_nodes, n_heads, -1, dim).to(tree_dtype)
-            k_parent = merged.shape[3]
+            k_parent = min(merged.shape[3], self._k_at_depth(d_from_leaf))
 
             parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
             both = has_left & has_right
@@ -387,7 +635,7 @@ class DCWTv2Attention(nn.Module):
             right_only = has_right & ~has_left
 
             if bool(both.any()):
-                parent[:, both, :, :k_parent, :] = merged[:, both, :, :, :]
+                parent[:, both, :, :k_parent, :] = merged[:, both, :, :k_parent, :]
             if bool(left_only.any()):
                 parent[:, left_only, :, :k_child, :] = f_left[:, left_only, :, :, :]
             if bool(right_only.any()):
@@ -398,6 +646,126 @@ class DCWTv2Attention(nn.Module):
 
             tree[:, node_start:node_end, :, :, :] = parent
             node_present[node_start:node_end] = has_any
+
+        return tree
+
+    def _build_tree_jacobi(self, v: torch.Tensor, jacobi_iters: int = 2) -> torch.Tensor:
+        """
+        Parallel Jacobi tree update using previous-iteration child values.
+
+        v: (B, N, H, D_head)
+        returns: (B, T, H, K_max, D_head)
+        """
+        if jacobi_iters <= 0:
+            return self._build_tree_training(v)
+
+        bsz, seq_len, n_heads, dim = v.shape
+        tree_size = self.cst.tree_size
+        tree = v.new_zeros(bsz, tree_size, n_heads, self.k_max, dim)
+        tree_dtype = tree.dtype
+
+        node_present = torch.zeros(tree_size, dtype=torch.bool, device=v.device)
+        leaf_start = self.leaf_start
+        leaf_end = leaf_start + seq_len
+        tree[:, leaf_start:leaf_end, :, :1, :] = v.unsqueeze(3)
+        node_present[leaf_start:leaf_end] = True
+
+        # Haar-like bootstrap on internals to start Jacobi close to useful structure.
+        with torch.no_grad():
+            for d_from_leaf in range(1, self.log_n + 1):
+                d_from_root = self.log_n - d_from_leaf
+                node_start = 2 ** d_from_root
+                node_end = 2 ** (d_from_root + 1)
+                n_nodes = node_end - node_start
+                if n_nodes <= 0:
+                    continue
+
+                left_idx = torch.arange(2 * node_start, 2 * node_end, 2, device=v.device)
+                right_idx = left_idx + 1
+                has_left = node_present[left_idx]
+                has_right = node_present[right_idx]
+                has_any = has_left | has_right
+                if not bool(has_any.any()):
+                    continue
+
+                k_child = self._k_at_depth(d_from_leaf - 1)
+                k_parent = self._k_at_depth(d_from_leaf)
+                f_left = tree[:, left_idx, :, :k_child, :]
+                f_right = tree[:, right_idx, :, :k_child, :]
+                parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
+
+                both = has_left & has_right
+                left_only = has_left & ~has_right
+                right_only = has_right & ~has_left
+                if bool(both.any()):
+                    k_boot = min(k_parent, k_child)
+                    parent[:, both, :, :k_boot, :] = (
+                        f_left[:, both, :, :k_boot, :] + f_right[:, both, :, :k_boot, :]
+                    ) / math.sqrt(2.0)
+                if bool(left_only.any()):
+                    parent[:, left_only, :, :k_child, :] = f_left[:, left_only, :, :, :]
+                if bool(right_only.any()):
+                    parent[:, right_only, :, :k_child, :] = f_right[:, right_only, :, :, :]
+
+                tree[:, node_start:node_end, :, :, :] = parent
+                node_present[node_start:node_end] = has_any
+
+        node_idx, left_idx, right_idx, depth_idx = _get_tree_structure(
+            self.max_seq_len, str(v.device)
+        )
+
+        for _ in range(jacobi_iters):
+            prev_tree = tree
+            prev_present = node_present
+            tree = prev_tree.clone()
+            node_present = prev_present.clone()
+
+            for depth in range(1, self.log_n + 1):
+                depth_mask = depth_idx == depth
+                if not bool(depth_mask.any()):
+                    continue
+
+                idx_d = node_idx[depth_mask]
+                left_d = left_idx[depth_mask]
+                right_d = right_idx[depth_mask]
+
+                has_left = prev_present[left_d]
+                has_right = prev_present[right_d]
+                has_any = has_left | has_right
+                if not bool(has_any.any()):
+                    continue
+
+                k_child = self._k_at_depth(depth - 1)
+                f_left = prev_tree[:, left_d, :, :k_child, :]
+                f_right = prev_tree[:, right_d, :, :k_child, :]
+                n_nodes = idx_d.numel()
+                parent = v.new_zeros(bsz, n_nodes, n_heads, self.k_max, dim)
+
+                both = has_left & has_right
+                left_only = has_left & ~has_right
+                right_only = has_right & ~has_left
+
+                if bool(both.any()):
+                    left_b = f_left[:, both, :, :, :]
+                    right_b = f_right[:, both, :, :, :]
+                    n_both = left_b.shape[1]
+                    left_flat = left_b.reshape(bsz * n_both, n_heads, k_child, dim)
+                    right_flat = right_b.reshape(bsz * n_both, n_heads, k_child, dim)
+                    merged = self.gated_wave_merge(left_flat, right_flat, depth)
+                    merged = merged.reshape(bsz, n_both, n_heads, -1, dim).to(tree_dtype)
+                    k_parent = min(merged.shape[3], self._k_at_depth(depth))
+                    parent[:, both, :, :k_parent, :] = merged[:, :, :, :k_parent, :]
+
+                if bool(left_only.any()):
+                    parent[:, left_only, :, :k_child, :] = f_left[:, left_only, :, :, :]
+                if bool(right_only.any()):
+                    parent[:, right_only, :, :k_child, :] = f_right[:, right_only, :, :, :]
+
+                coupling = F.softmax(self.cross_head_coupling[depth], dim=-1).to(tree_dtype)
+                parent = torch.einsum("ij,bmjkd->bmikd", coupling, parent).to(tree_dtype)
+
+                tree[:, idx_d, :, :, :] = parent
+                node_present[idx_d] = has_any
 
         return tree
 
@@ -545,7 +913,7 @@ class DCWTv2Attention(nn.Module):
 
             q_depth = self.ddq.get_query(q_flat, depth).view(bsz, seq_len, n_heads, dim)
             scale = self.ddq.get_scale(depth)
-            k_depth = k_at_depth(depth, self.k_max)
+            k_depth = self._k_at_depth(depth)
 
             # Vectorized over all cover slots at this depth.
             f_depth = f_nodes[:, :, :, :, :k_depth, :]  # (B, N, L, H, K_d, D)
@@ -559,7 +927,7 @@ class DCWTv2Attention(nn.Module):
         counts = valid_mask.sum(dim=1).clamp(min=1).view(1, seq_len, 1, 1).to(out.dtype)
         return (out / counts).to(q.dtype)
 
-    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask=None, jacobi_iters: int = 0) -> torch.Tensor:
         squeeze = False
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -580,7 +948,7 @@ class DCWTv2Attention(nn.Module):
             out_heads = local_out + torch.sigmoid(self.hybrid_alpha) * global_out
         else:
             v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
-            tree = self._build_tree_training(v)
+            tree = self._build_tree_jacobi(v, jacobi_iters=jacobi_iters)
             tree_out = self._query_tree(q, tree)
             out_heads = local_out + tree_out
 
@@ -738,6 +1106,9 @@ class DCWTv2TransformerLayer(nn.Module):
         local_window: int = 32,
         tree_mode: str = "flash_only",
         dropout: float = 0.1,
+        use_depth_conditioned_gwm: bool = False,
+        depth_embed_dim: int = 32,
+        compile_gwm: bool = True,
     ):
         super().__init__()
         self.attention = DCWTv2Attention(
@@ -748,6 +1119,9 @@ class DCWTv2TransformerLayer(nn.Module):
             local_window=local_window,
             tree_mode=tree_mode,
             dropout=dropout,
+            use_depth_conditioned_gwm=use_depth_conditioned_gwm,
+            depth_embed_dim=depth_embed_dim,
+            compile_gwm=compile_gwm,
         )
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_dim),
@@ -760,8 +1134,8 @@ class DCWTv2TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(embedding_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
-        x = x + self.dropout(self.attention(self.norm1(x), mask))
+    def forward(self, x: torch.Tensor, mask=None, jacobi_iters: int = 0) -> torch.Tensor:
+        x = x + self.dropout(self.attention(self.norm1(x), mask, jacobi_iters=jacobi_iters))
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -816,6 +1190,13 @@ class DCWTv2Transformer(nn.Module):
         tree_mode: str = "flash_only",
         dropout: float = 0.1,
         use_checkpoint: bool = False,
+        use_depth_conditioned_gwm: bool = False,
+        depth_embed_dim: int = 32,
+        compile_gwm: bool = True,
+        use_haar_init: bool = False,
+        d_model: Optional[int] = None,
+        n_layers: Optional[int] = None,
+        n_heads: Optional[int] = None,
         field_size: Optional[int] = None,
         interference_interval: Optional[int] = None,
         device: Optional[torch.device] = None,
@@ -823,10 +1204,18 @@ class DCWTv2Transformer(nn.Module):
         super().__init__()
         del field_size, interference_interval, device
 
+        if d_model is not None:
+            embedding_dim = d_model
+        if n_layers is not None:
+            num_layers = n_layers
+        if n_heads is not None:
+            num_heads = n_heads
+
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.max_seq_len = max_seq_len
         self.use_checkpoint = use_checkpoint
+        self.use_depth_conditioned_gwm = use_depth_conditioned_gwm
 
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
         self.pos_encoding = SinusoidalPositionalEncoding(embedding_dim, max_seq_len * 2)
@@ -843,6 +1232,9 @@ class DCWTv2Transformer(nn.Module):
                     local_window=local_window,
                     tree_mode=tree_mode,
                     dropout=dropout,
+                    use_depth_conditioned_gwm=use_depth_conditioned_gwm,
+                    depth_embed_dim=depth_embed_dim,
+                    compile_gwm=compile_gwm,
                 )
                 for _ in range(num_layers)
             ]
@@ -853,6 +1245,8 @@ class DCWTv2Transformer(nn.Module):
         self.output_projection.weight = self.token_embedding.weight
 
         self._init_weights()
+        if use_haar_init:
+            self.apply_haar_init()
 
     def _init_weights(self) -> None:
         for module in self.modules():
@@ -863,7 +1257,28 @@ class DCWTv2Transformer(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: torch.Tensor, labels=None, mask=None):
+    def apply_haar_init(self) -> None:
+        from .bio_init import init_all_depths_haar
+
+        init_all_depths_haar(self)
+
+    def get_tree_grad_norms(self) -> Dict[int, float]:
+        agg: Dict[int, float] = {}
+        cnt: Dict[int, int] = {}
+        for layer in self.layers:
+            layer_norms = layer.attention.get_tree_grad_norms()
+            for d, v in layer_norms.items():
+                agg[d] = agg.get(d, 0.0) + float(v)
+                cnt[d] = cnt.get(d, 0) + 1
+        return {d: agg[d] / max(cnt[d], 1) for d in agg}
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels=None,
+        mask=None,
+        jacobi_iters: int = 0,
+    ):
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
 
@@ -874,9 +1289,13 @@ class DCWTv2Transformer(nn.Module):
 
         for layer in self.layers:
             if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x, mask, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(
+                    lambda y: layer(y, mask, jacobi_iters=jacobi_iters),
+                    x,
+                    use_reentrant=False,
+                )
             else:
-                x = layer(x, mask)
+                x = layer(x, mask, jacobi_iters=jacobi_iters)
 
         x = self.norm(x)
         logits = self.output_projection(x)
@@ -934,12 +1353,13 @@ class DCWTv2Transformer(nn.Module):
         top_k: Optional[int],
         top_p: Optional[float],
         repetition_penalty: float,
+        jacobi_iters: int = 0,
     ) -> torch.Tensor:
         generated = input_ids.clone()
         for _ in range(max_new_tokens):
             if generated.shape[1] >= self.max_seq_len:
                 break
-            logits, _ = self.forward(generated)
+            logits, _ = self.forward(generated, jacobi_iters=jacobi_iters)
             next_token = self._sample_next_token(
                 logits[:, -1, :],
                 generated,
@@ -960,6 +1380,7 @@ class DCWTv2Transformer(nn.Module):
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
         repetition_penalty: float = 1.2,
+        jacobi_iters: int = 0,
     ) -> torch.Tensor:
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
@@ -983,6 +1404,7 @@ class DCWTv2Transformer(nn.Module):
                     top_k,
                     top_p,
                     repetition_penalty,
+                    jacobi_iters=jacobi_iters,
                 )
 
             generated = input_ids.clone()
@@ -1046,6 +1468,7 @@ __all__ = [
     "k_at_depth",
     "CausalSegmentTree",
     "GatedWaveMerge",
+    "DepthConditionedGWM",
     "DepthDecomposedQuery",
     "DCWTv2Attention",
     "DCWTv2InferenceCache",

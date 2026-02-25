@@ -12,6 +12,7 @@ from .dcwt_v2 import (
     DCWTv2InferenceCache,
     DCWTv2Transformer,
     DCWTv2TransformerLayer,
+    DepthConditionedGWM,
     DepthDecomposedQuery,
     GatedWaveMerge,
     SinusoidalPositionalEncoding,
@@ -83,9 +84,9 @@ __all__ = [
     "DCWTv2Transformer",
     "DCWTv2TransformerLayer",
     "DCWTv2InferenceCache",
+    "DepthConditionedGWM",
     "DepthDecomposedQuery",
     "GatedWaveMerge",
     "SinusoidalPositionalEncoding",
     "k_at_depth",
 ]
-

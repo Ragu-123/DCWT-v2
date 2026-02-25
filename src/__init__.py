@@ -12,11 +12,14 @@ from .dcwt_v2 import (
     DCWTv2InferenceCache,
     DCWTv2Transformer,
     DCWTv2TransformerLayer,
+    DepthConditionedGWM,
     DepthDecomposedQuery,
     GatedWaveMerge,
     SinusoidalPositionalEncoding,
     k_at_depth,
 )
+from .bio_init import init_all_depths_haar, init_gwm_haar
+from .bio_scheduler import SlimeMoldKScheduler, heartbeat_schedule, set_gwm_depth_frozen
 from .global_context import GlobalContextModule
 from .wave_field_attention import WaveFieldAttention
 from .wave_field_transformer import FieldInterferenceModule, WaveFieldTransformer
@@ -33,8 +36,14 @@ __all__ = [
     "DCWTv2InferenceCache",
     "DCWTv2Transformer",
     "DCWTv2TransformerLayer",
+    "DepthConditionedGWM",
     "DepthDecomposedQuery",
     "GatedWaveMerge",
     "SinusoidalPositionalEncoding",
     "k_at_depth",
+    "init_gwm_haar",
+    "init_all_depths_haar",
+    "set_gwm_depth_frozen",
+    "heartbeat_schedule",
+    "SlimeMoldKScheduler",
 ]

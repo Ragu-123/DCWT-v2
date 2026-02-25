@@ -11,9 +11,11 @@ import time
 import os
 import math
 import json
+from typing import Any, Dict, Optional
 from torch.utils.data import DataLoader, Dataset
 
 from src.dcwt_v2 import DCWTv2Transformer
+from src.bio_scheduler import SlimeMoldKScheduler, heartbeat_schedule
 
 
 # ======================================================================
@@ -205,6 +207,28 @@ def get_autocast_config(device):
     return "cpu", torch.bfloat16
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_dcwt_model(model: nn.Module) -> bool:
+    return isinstance(model, DCWTv2Transformer)
+
+
+def _model_forward(
+    model: nn.Module,
+    x: torch.Tensor,
+    bio_cfg: Optional[Dict[str, Any]] = None,
+):
+    bio_cfg = bio_cfg or {}
+    if _is_dcwt_model(model):
+        return model(x, jacobi_iters=int(bio_cfg.get("jacobi_iters", 0)))
+    return model(x)
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -214,6 +238,7 @@ def evaluate(
     use_amp=False,
     autocast_device="cuda",
     autocast_dtype=torch.float16,
+    bio_cfg: Optional[Dict[str, Any]] = None,
 ):
     model.eval()
     tl, tc, tt, n = 0, 0, 0, 0
@@ -223,7 +248,7 @@ def evaluate(
         with torch.amp.autocast(
             autocast_device, enabled=use_amp, dtype=autocast_dtype
         ):
-            logits, _ = model(x)
+            logits, _ = _model_forward(model, x, bio_cfg)
             loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1), ignore_index=-100)
         tl += loss.item(); n += 1
         mask = y != -100
@@ -236,30 +261,50 @@ def evaluate(
 
 @torch.no_grad()
 def generate_text(model, tok, seed, device, max_tokens=60,
-                  temperature=0.8, top_k=50, top_p=0.92, rep_penalty=1.2):
+                  temperature=0.8, top_k=50, top_p=0.92, rep_penalty=1.2,
+                  bio_cfg: Optional[Dict[str, Any]] = None):
     model.eval()
     ids = tok.encode(seed)
     if not ids:
         return seed + " [empty]"
+    bio_cfg = bio_cfg or {}
+    if _is_dcwt_model(model):
+        inp = torch.tensor(ids, device=device).unsqueeze(0)
+        out = model.generate(
+            inp,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=rep_penalty,
+            jacobi_iters=int(bio_cfg.get("jacobi_iters", 0)),
+        )
+        model.train()
+        return tok.decode(out[0].tolist())
+
     gen = ids.copy()
     inp = torch.tensor(ids, device=device).unsqueeze(0)
     for _ in range(max_tokens):
         logits, _ = model(inp)
         nl = logits[0, -1, :] / temperature
         for pid in set(gen[-30:]):
-            if nl[pid] > 0: nl[pid] /= rep_penalty
-            else: nl[pid] *= rep_penalty
+            if nl[pid] > 0:
+                nl[pid] /= rep_penalty
+            else:
+                nl[pid] *= rep_penalty
         if top_k > 0:
             tv, ti = torch.topk(nl, min(top_k, nl.size(-1)))
-            f = torch.full_like(nl, float('-inf'))
+            f = torch.full_like(nl, float("-inf"))
             f.scatter_(0, ti, tv)
         else:
             f = nl
         if top_p < 1.0:
             sl, si = torch.sort(f, descending=True)
             cp = torch.cumsum(F.softmax(sl, dim=-1), dim=-1)
-            rm = cp > top_p; rm[1:] = rm[:-1].clone(); rm[0] = False
-            f[si[rm]] = float('-inf')
+            rm = cp > top_p
+            rm[1:] = rm[:-1].clone()
+            rm[0] = False
+            f[si[rm]] = float("-inf")
         nid = torch.multinomial(F.softmax(f, dim=-1), 1).item()
         gen.append(nid)
         inp = torch.tensor([gen], device=device)
@@ -270,8 +315,10 @@ def generate_text(model, tok, seed, device, max_tokens=60,
 def train_model(model, train_data, val_data, tok, vocab_size, device,
                 model_name, num_epochs=30, batch_size=64, grad_accum=1, peak_lr=0.0004,
                 use_amp=True, autocast_device="cuda", autocast_dtype=torch.float16,
-                save_dir="checkpoints"):
+                save_dir="checkpoints", bio_cfg: Optional[Dict[str, Any]] = None):
     os.makedirs(save_dir, exist_ok=True)
+    bio_cfg = bio_cfg or {}
+    use_bio = _is_dcwt_model(model) and bool(bio_cfg.get("enabled", False))
 
     params = sum(p.numel() for p in model.parameters())
     print(f"\n  {model_name}: {params:,} parameters")
@@ -285,6 +332,16 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
     scaler = torch.amp.GradScaler(
         "cuda", enabled=(use_amp and autocast_device == "cuda")
     )
+    slime = None
+    if use_bio and bio_cfg.get("use_slime_mold", False):
+        slime = SlimeMoldKScheduler(
+            model,
+            alpha=float(bio_cfg.get("slime_alpha", 0.3)),
+            mu=float(bio_cfg.get("slime_mu", 0.3)),
+            update_every=int(bio_cfg.get("slime_update_every", 500)),
+        )
+    slime_start_step = int(bio_cfg.get("slime_start_step", 8000))
+    global_step = 0
 
     best_vl, best_vp, best_va, best_ep = float('inf'), float('inf'), 0, 0
 
@@ -298,10 +355,12 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
         for step, (x, y) in enumerate(train_loader, start=1):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            if use_bio and bio_cfg.get("use_heartbeat", False):
+                heartbeat_schedule(global_step, model)
             with torch.amp.autocast(
                 autocast_device, enabled=use_amp, dtype=autocast_dtype
             ):
-                logits, _ = model(x)
+                logits, _ = _model_forward(model, x, bio_cfg)
                 loss = F.cross_entropy(
                     logits.reshape(-1, vocab_size),
                     y.reshape(-1),
@@ -315,11 +374,16 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
 
             if step % grad_accum == 0 or step == len(train_loader):
                 scaler.unscale_(optimizer)
+                if slime is not None and global_step >= slime_start_step:
+                    slime.accumulate(model.get_tree_grad_norms())
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if slime is not None and global_step >= slime_start_step:
+                    slime.update()
         al = tl / max(nb, 1)
         et = time.time() - et
 
@@ -332,6 +396,7 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
                 use_amp=use_amp,
                 autocast_device=autocast_device,
                 autocast_dtype=autocast_dtype,
+                bio_cfg=bio_cfg,
             )
             if vl < best_vl:
                 best_vl, best_vp, best_va, best_ep = vl, vp, va, epoch
@@ -341,7 +406,14 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
                 mk = ""
             print(f"  Ep {epoch:3d}/{num_epochs} | Train {al:.4f} | Val {vl:.4f} PPL {vp:.1f} Acc {va:.1f}% | {et:.1f}s{mk}")
             if epoch % 10 == 0:
-                sample = generate_text(model, tok, "The president of the", device, max_tokens=30)
+                sample = generate_text(
+                    model,
+                    tok,
+                    "The president of the",
+                    device,
+                    max_tokens=30,
+                    bio_cfg=bio_cfg,
+                )
                 print(f"    Gen: {sample}")
         else:
             print(f"  Ep {epoch:3d}/{num_epochs} | Train {al:.4f} | {et:.1f}s")
@@ -364,14 +436,41 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
 # ======================================================================
 
 def main():
-    # Keep benchmark startup deterministic and avoid compile warmup overhead.
-    os.environ["DCWT_COMPILE"] = "0"
-    dcwt_tree_mode = os.environ.get("DCWT_TREE_MODE", "flash_only")
+    bio_enabled = _env_flag("DCWT_BIO_FLOW", True)
+    dcwt_tree_mode = os.environ.get("DCWT_TREE_MODE", "full" if bio_enabled else "flash_only")
+    if bio_enabled and dcwt_tree_mode != "full":
+        print("  Bio flow requires tree_mode='full'; overriding requested tree_mode.")
+        dcwt_tree_mode = "full"
+    bio_cfg: Dict[str, Any] = {
+        "enabled": bio_enabled,
+        "jacobi_iters": int(os.environ.get("DCWT_JACOBI_ITERS", "2" if bio_enabled else "0")),
+        "use_depth_conditioned_gwm": _env_flag("DCWT_DEPTH_COND_GWM", bio_enabled),
+        "depth_embed_dim": int(os.environ.get("DCWT_DEPTH_EMBED_DIM", "32")),
+        "use_haar_init": _env_flag("DCWT_HAAR_INIT", bio_enabled),
+        "use_heartbeat": _env_flag("DCWT_HEARTBEAT", bio_enabled),
+        "use_slime_mold": _env_flag("DCWT_SLIME_MOLD", bio_enabled),
+        "slime_alpha": float(os.environ.get("DCWT_SLIME_ALPHA", "0.3")),
+        "slime_mu": float(os.environ.get("DCWT_SLIME_MU", "0.3")),
+        "slime_update_every": int(os.environ.get("DCWT_SLIME_UPDATE_EVERY", "500")),
+        "slime_start_step": int(os.environ.get("DCWT_SLIME_START_STEP", "8000")),
+        "compile_gwm": _env_flag("DCWT_COMPILE_GWM", True),
+    }
+    if not bio_enabled:
+        bio_cfg["jacobi_iters"] = 0
 
     print("=" * 65)
     print("  DCWT-v2 + BPE TOKENIZER")
     print("  Standard Transformer vs DCWT-v2 — fair BPE comparison")
     print(f"  DCWT tree_mode: {dcwt_tree_mode}")
+    print(
+        "  Bio flow:"
+        f" enabled={bio_cfg['enabled']}"
+        f" depth_cond_gwm={bio_cfg['use_depth_conditioned_gwm']}"
+        f" haar={bio_cfg['use_haar_init']}"
+        f" jacobi_iters={bio_cfg['jacobi_iters']}"
+        f" heartbeat={bio_cfg['use_heartbeat']}"
+        f" slime={bio_cfg['use_slime_mold']}"
+    )
     print("=" * 65)
 
     splits = load_wikitext2()
@@ -446,13 +545,14 @@ def main():
         grad_accum=grad_accum, peak_lr=peak_lr, use_amp=use_amp,
         autocast_device=autocast_device, autocast_dtype=autocast_dtype,
         save_dir="bpe_std_checkpoints",
+        bio_cfg={"enabled": False},
     )
     results.append(std_result)
 
     print(f"\n  --- Standard Transformer Generation ---")
     for seed in ["The president of the", "In the year", "Scientists discovered that",
                  "The city of New York", "He was born in"]:
-        text = generate_text(std_model, tok, seed, device, max_tokens=40)
+        text = generate_text(std_model, tok, seed, device, max_tokens=40, bio_cfg={"enabled": False})
         print(f"  [{seed}] -> {text}")
 
     test_loader = create_dataloader(test_data, batch_size=batch_size, shuffle=False)
@@ -464,6 +564,7 @@ def main():
         use_amp=use_amp,
         autocast_device=autocast_device,
         autocast_dtype=autocast_dtype,
+        bio_cfg={"enabled": False},
     )
     std_result['test_ppl'] = std_tp
     std_result['test_acc'] = std_ta
@@ -491,6 +592,10 @@ def main():
         tree_mode=dcwt_tree_mode,
         dropout=0.1,
         use_checkpoint=False,
+        use_depth_conditioned_gwm=bool(bio_cfg["use_depth_conditioned_gwm"]),
+        depth_embed_dim=int(bio_cfg["depth_embed_dim"]),
+        compile_gwm=bool(bio_cfg["compile_gwm"]),
+        use_haar_init=bool(bio_cfg["use_haar_init"]),
     ).to(device)
 
     wave_result = train_model(
@@ -499,13 +604,14 @@ def main():
         grad_accum=grad_accum, peak_lr=peak_lr, use_amp=use_amp,
         autocast_device=autocast_device, autocast_dtype=autocast_dtype,
         save_dir="bpe_dcwt_v2_checkpoints",
+        bio_cfg=bio_cfg,
     )
     results.append(wave_result)
 
     print(f"\n  --- DCWT-v2 Generation ---")
     for seed in ["The president of the", "In the year", "Scientists discovered that",
                  "The city of New York", "He was born in"]:
-        text = generate_text(wave_model, tok, seed, device, max_tokens=40)
+        text = generate_text(wave_model, tok, seed, device, max_tokens=40, bio_cfg=bio_cfg)
         print(f"  [{seed}] -> {text}")
 
     test_loader = create_dataloader(test_data, batch_size=batch_size, shuffle=False)
@@ -517,6 +623,7 @@ def main():
         use_amp=use_amp,
         autocast_device=autocast_device,
         autocast_dtype=autocast_dtype,
+        bio_cfg=bio_cfg,
     )
     wave_result['test_ppl'] = wave_tp
     wave_result['test_acc'] = wave_ta

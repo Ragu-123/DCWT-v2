@@ -262,6 +262,7 @@ class DCWTv2Attention(nn.Module):
         max_seq_len: int,
         k_max: int = 8,
         local_window: int = 32,
+        tree_mode: str = "flash_only",
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -274,6 +275,11 @@ class DCWTv2Attention(nn.Module):
         self.max_seq_len = max_seq_len
         self.k_max = k_max
         self.local_window = local_window
+        if tree_mode not in {"full", "local_only", "fast_hybrid", "flash_only"}:
+            raise ValueError(
+                "tree_mode must be one of: {'full', 'local_only', 'fast_hybrid', 'flash_only'}"
+            )
+        self.tree_mode = tree_mode
 
         self.q_proj = nn.Linear(embedding_dim, embedding_dim)
         self.v_proj = nn.Linear(embedding_dim, embedding_dim)
@@ -281,6 +287,16 @@ class DCWTv2Attention(nn.Module):
 
         self.k_local_proj = nn.Linear(embedding_dim, embedding_dim)
         self.v_local_proj = nn.Linear(embedding_dim, embedding_dim)
+        # Fast-hybrid global branch: kernelized causal linear attention.
+        self.global_feature_dim = min(8, self.head_dim)
+        self.q_global_proj = nn.Linear(
+            embedding_dim, num_heads * self.global_feature_dim
+        )
+        self.k_global_proj = nn.Linear(
+            embedding_dim, num_heads * self.global_feature_dim
+        )
+        self.v_global_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.hybrid_alpha = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
         self.cst = CausalSegmentTree(max_seq_len)
         self.log_n = self.cst.log_n
@@ -406,20 +422,64 @@ class DCWTv2Attention(nn.Module):
         k_t = k_local.transpose(1, 2)
         v_t = v_local.transpose(1, 2)
 
-        local_mask = self._get_local_mask(seq_len, window, q.device)
-        attn_bias = torch.zeros(seq_len, seq_len, device=q.device, dtype=q_t.dtype)
-        attn_bias.masked_fill_(~local_mask, float("-inf"))
-
         out = F.scaled_dot_product_attention(
             q_t,
             k_t,
             v_t,
-            attn_mask=attn_bias,
+            attn_mask=self._get_local_mask(seq_len, window, q.device),
             dropout_p=0.0,
             scale=1.0 / math.sqrt(dim),
         )
         out = torch.nan_to_num(out, nan=0.0)
         return out.transpose(1, 2)
+
+    def _flash_causal_attention(self, q: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Fast path that lets SDPA pick fused causal kernels (Flash/MemEfficient).
+        """
+        bsz, seq_len, n_heads, dim = q.shape
+        k_local = self.k_local_proj(x).view(bsz, seq_len, n_heads, dim)
+        v_local = self.v_local_proj(x).view(bsz, seq_len, n_heads, dim)
+
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k_local.transpose(1, 2),
+            v_local.transpose(1, 2),
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=1.0 / math.sqrt(dim),
+        )
+        out = torch.nan_to_num(out, nan=0.0)
+        return out.transpose(1, 2)
+
+    def _linear_global_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Causal linear attention with prefix-sum KV states.
+        Complexity: O(B * N * H * R * D), where R is a small feature rank.
+        """
+        bsz, seq_len, _ = x.shape
+        n_heads = self.num_heads
+        dim = self.head_dim
+        rank = self.global_feature_dim
+
+        q_feat = self.q_global_proj(x).view(bsz, seq_len, n_heads, rank)
+        k_feat = self.k_global_proj(x).view(bsz, seq_len, n_heads, rank)
+        v = self.v_global_proj(x).view(bsz, seq_len, n_heads, dim)
+
+        # Keep prefix sums in fp32 for stability under autocast.
+        work_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+        q_phi = (F.elu(q_feat.to(work_dtype)) + 1.0).clamp_min(1e-4)
+        k_phi = (F.elu(k_feat.to(work_dtype)) + 1.0).clamp_min(1e-4)
+        v_work = v.to(work_dtype)
+
+        kv = torch.einsum("bnhr,bnhd->bnhrd", k_phi, v_work)
+        kv_prefix = torch.cumsum(kv, dim=1)
+        k_prefix = torch.cumsum(k_phi, dim=1)
+
+        numerator = torch.einsum("bnhr,bnhrd->bnhd", q_phi, kv_prefix)
+        denominator = (q_phi * k_prefix).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return (numerator / denominator).to(x.dtype)
 
     def _get_cover_table(
         self, n_tokens: int, device: torch.device
@@ -472,17 +532,13 @@ class DCWTv2Attention(nn.Module):
             scale = self.ddq.get_scale(depth)
             k_depth = k_at_depth(depth, self.k_max)
 
-            for slot in range(max_cover):
-                active = depth_mask[:, slot]
-                if not bool(active.any()):
-                    continue
-
-                f_slot = f_nodes[:, :, slot, :, :k_depth, :]  # (B, N, H, K_d, D)
-                scores = (q_depth.unsqueeze(3) * f_slot).sum(-1) * scale
-                weights = F.softmax(scores, dim=-1)
-                attended = (weights.unsqueeze(-1) * f_slot).sum(3)
-                active_mask = active.view(1, seq_len, 1, 1).to(dtype=attended.dtype)
-                out = out + attended * active_mask
+            # Vectorized over all cover slots at this depth.
+            f_depth = f_nodes[:, :, :, :, :k_depth, :]  # (B, N, L, H, K_d, D)
+            scores = (q_depth.unsqueeze(2).unsqueeze(4) * f_depth).sum(-1) * scale
+            weights = F.softmax(scores, dim=-1)
+            attended = (weights.unsqueeze(-1) * f_depth).sum(-2)  # (B, N, L, H, D)
+            slot_mask = depth_mask.view(1, seq_len, max_cover, 1, 1).to(attended.dtype)
+            out = out + (attended * slot_mask).sum(dim=2)
 
         # Preserve the original behavior: mean over nodes in cover set.
         counts = valid_mask.sum(dim=1).clamp(min=1).view(1, seq_len, 1, 1).to(out.dtype)
@@ -496,13 +552,24 @@ class DCWTv2Attention(nn.Module):
 
         bsz, seq_len, dim = x.shape
         q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
 
-        local_out = self._local_attention(q, x)
-        tree = self._build_tree_training(v)
-        tree_out = self._query_tree(q, tree)
+        if self.tree_mode in {"fast_hybrid", "flash_only"}:
+            local_out = self._flash_causal_attention(q, x)
+        else:
+            local_out = self._local_attention(q, x)
 
-        out = (local_out + tree_out).reshape(bsz, seq_len, dim)
+        if self.tree_mode in {"local_only", "flash_only"}:
+            out_heads = local_out
+        elif self.tree_mode == "fast_hybrid":
+            global_out = self._linear_global_attention(x)
+            out_heads = local_out + torch.sigmoid(self.hybrid_alpha) * global_out
+        else:
+            v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+            tree = self._build_tree_training(v)
+            tree_out = self._query_tree(q, tree)
+            out_heads = local_out + tree_out
+
+        out = out_heads.reshape(bsz, seq_len, dim)
         out = out * torch.sigmoid(self.gate_proj(x))
         out = self.dropout(self.out_proj(out))
 
@@ -633,6 +700,7 @@ class DCWTv2TransformerLayer(nn.Module):
         max_seq_len: int,
         k_max: int = 8,
         local_window: int = 32,
+        tree_mode: str = "flash_only",
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -642,6 +710,7 @@ class DCWTv2TransformerLayer(nn.Module):
             max_seq_len=max_seq_len,
             k_max=k_max,
             local_window=local_window,
+            tree_mode=tree_mode,
             dropout=dropout,
         )
         self.ffn = nn.Sequential(
@@ -701,6 +770,7 @@ class DCWTv2Transformer(nn.Module):
         max_seq_len: int = 256,
         k_max: int = 8,
         local_window: int = 32,
+        tree_mode: str = "flash_only",
         dropout: float = 0.1,
         use_checkpoint: bool = False,
         field_size: Optional[int] = None,
@@ -728,13 +798,16 @@ class DCWTv2Transformer(nn.Module):
                     max_seq_len=max_seq_len,
                     k_max=k_max,
                     local_window=local_window,
+                    tree_mode=tree_mode,
                     dropout=dropout,
                 )
                 for _ in range(num_layers)
             ]
         )
 
-        if os.environ.get("DCWT_COMPILE", "1") == "1" and hasattr(torch, "compile"):
+        should_compile = os.environ.get("DCWT_COMPILE", "0") == "1"
+        can_compile = hasattr(torch, "compile") and torch.cuda.is_available() and not use_checkpoint
+        if should_compile and can_compile:
             try:
                 for layer in self.layers:
                     layer.attention.gated_wave_merge = torch.compile(

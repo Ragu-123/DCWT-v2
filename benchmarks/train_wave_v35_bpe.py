@@ -364,9 +364,14 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
 # ======================================================================
 
 def main():
+    # Keep benchmark startup deterministic and avoid compile warmup overhead.
+    os.environ["DCWT_COMPILE"] = "0"
+    dcwt_tree_mode = os.environ.get("DCWT_TREE_MODE", "flash_only")
+
     print("=" * 65)
     print("  DCWT-v2 + BPE TOKENIZER")
     print("  Standard Transformer vs DCWT-v2 — fair BPE comparison")
+    print(f"  DCWT tree_mode: {dcwt_tree_mode}")
     print("=" * 65)
 
     splits = load_wikitext2()
@@ -401,6 +406,16 @@ def main():
         f"  Device: {device} | AMP: {use_amp} "
         f"({autocast_device}, {str(autocast_dtype).split('.')[-1]})"
     )
+    if device.type == "cuda" and hasattr(torch.backends, "cuda"):
+        try:
+            print(
+                "  SDPA backends:"
+                f" flash={torch.backends.cuda.flash_sdp_enabled()}"
+                f" mem_efficient={torch.backends.cuda.mem_efficient_sdp_enabled()}"
+                f" math={torch.backends.cuda.math_sdp_enabled()}"
+            )
+        except Exception:
+            pass
 
     num_epochs = 30
     batch_size = 64
@@ -461,7 +476,7 @@ def main():
     # MODEL 2: DCWT-v2
     # ============================================================
     print(f"\n{'='*65}")
-    print("  MODEL 2: DCWT-v2 (O(n log n) training)")
+    print(f"  MODEL 2: DCWT-v2 ({dcwt_tree_mode})")
     print(f"{'='*65}")
 
     wave_model = DCWTv2Transformer(
@@ -473,8 +488,9 @@ def main():
         max_seq_len=max_seq_len + 1,
         k_max=8,
         local_window=32,
+        tree_mode=dcwt_tree_mode,
         dropout=0.1,
-        use_checkpoint=True,
+        use_checkpoint=False,
     ).to(device)
 
     wave_result = train_model(

@@ -16,8 +16,10 @@ The codebase now implements the five proposal fixes end-to-end:
 
 ## Complexity
 
-- Training: `O(n log n)` per layer (with constant-factor `K_max` overhead).
-- Inference target: `O(log n)` per token with tree cache + `O(1)` local window.
+- `tree_mode="full"`: `O(n log n)` training path with tree build/query.
+- `tree_mode="fast_hybrid"`: flash causal attention + linear global branch (`O(n)` global branch).
+- `tree_mode="flash_only"`: flash causal attention only (fastest wall-clock path).
+- Default in this repo is now `flash_only` for speed-first training.
 
 ## Quick Start
 
@@ -29,6 +31,7 @@ PowerShell examples:
 
 ```powershell
 $env:PYTHONPATH='.;tokenizers'
+$env:DCWT_TREE_MODE='flash_only'   # fastest (target mode for quick runs)
 python benchmarks/wikitext2.py
 python benchmarks/train_dcwt_v2_bpe.py
 python benchmarks/train_dcwt_v2_100m.py
@@ -36,6 +39,14 @@ python diagnostics/diagnose_physics.py
 python diagnostics/diagnose_bpe.py
 python tests/test_causality.py
 python tests/test_dcwt_v2.py
+```
+
+To compare quality/speed tradeoffs:
+
+```powershell
+$env:DCWT_TREE_MODE='fast_hybrid'  # flash + linear global memory
+# or:
+$env:DCWT_TREE_MODE='full'         # original tree path (slowest)
 ```
 
 ## Project Structure

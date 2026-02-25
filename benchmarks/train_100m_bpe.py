@@ -392,9 +392,14 @@ def train_model(model, train_data, val_data, tok, vocab_size, device,
 # ======================================================================
 
 def main():
+    # Keep benchmark startup deterministic and avoid compile warmup overhead.
+    os.environ["DCWT_COMPILE"] = "0"
+    dcwt_tree_mode = os.environ.get("DCWT_TREE_MODE", "flash_only")
+
     print("=" * 70)
     print("  DCWT-v2 — 100M PARAMS / 32K VOCAB / OPENWEBTEXT")
     print("  Scaling test for DCWT-v2")
+    print(f"  DCWT tree_mode: {dcwt_tree_mode}")
     print("=" * 70)
     print(f"\n  Previous (6-8M, WikiText-2): large gap on BPE settings")
     print(f"  Now: 100M params, 32K BPE vocab, OpenWebText")
@@ -442,6 +447,16 @@ def main():
         f"  Device: {device} | AMP: {use_amp} "
         f"({autocast_device}, {str(autocast_dtype).split('.')[-1]})"
     )
+    if device.type == "cuda" and hasattr(torch.backends, "cuda"):
+        try:
+            print(
+                "  SDPA backends:"
+                f" flash={torch.backends.cuda.flash_sdp_enabled()}"
+                f" mem_efficient={torch.backends.cuda.mem_efficient_sdp_enabled()}"
+                f" math={torch.backends.cuda.math_sdp_enabled()}"
+            )
+        except Exception:
+            pass
 
     # 100M config
     embed_dim = 768
@@ -518,7 +533,7 @@ def main():
     # MODEL 2: DCWT-v2 100M
     # ============================================================
     print(f"\n{'='*70}")
-    print("  MODEL 2: DCWT-v2 ~100M (O(n log n) training)")
+    print(f"  MODEL 2: DCWT-v2 ~100M ({dcwt_tree_mode})")
     print(f"{'='*70}")
 
     wave_model = DCWTv2Transformer(
@@ -530,8 +545,9 @@ def main():
         max_seq_len=max_seq_len + 2,
         k_max=8,
         local_window=64,
+        tree_mode=dcwt_tree_mode,
         dropout=0.1,
-        use_checkpoint=True,
+        use_checkpoint=False,
     ).to(device)
 
     wave_result = train_model(
